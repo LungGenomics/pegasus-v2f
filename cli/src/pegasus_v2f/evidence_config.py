@@ -15,8 +15,9 @@ EVIDENCE_ROLES = {"locus_definition", "gwas_sumstats"}
 EVIDENCE_CENTRICS = {"gene", "variant"}
 
 # Required field mappings per role / centric
+# Note: locus_definition "trait" requirement is conditional — see validate_evidence_config
 REQUIRED_FIELDS = {
-    "locus_definition": {"gene", "trait", "chromosome", "position"},
+    "locus_definition": {"gene", "chromosome", "position"},
     "gwas_sumstats": {"chromosome", "position", "pvalue"},
     "gene": {"gene"},
     "variant": {"gene"},
@@ -26,25 +27,41 @@ REQUIRED_FIELDS = {
 def validate_pegasus_config(config: dict) -> list[str]:
     """Validate the pegasus: section of the config.
 
+    Supports pegasus.study as a list of study dicts (multi-study).
     Returns list of error messages (empty = valid).
     """
+    from pegasus_v2f.config import get_study_list
+
     errors = []
     pegasus = config.get("pegasus")
     if pegasus is None:
         return errors  # No pegasus section — nothing to validate
 
-    # Study config
-    study = pegasus.get("study")
-    if not study:
+    # Study config — must be a non-empty list
+    studies = get_study_list(config)
+    if not studies:
         errors.append("pegasus.study is required when pegasus: section is present")
         return errors
 
-    if "id_prefix" not in study:
-        errors.append("pegasus.study.id_prefix is required")
+    # Validate each study entry
+    seen_prefixes: set[str] = set()
+    all_traits_by_study: dict[str, list[str]] = {}
+    for i, study in enumerate(studies):
+        label = f"pegasus.study[{i}]"
+        prefix = study.get("id_prefix")
+        if not prefix:
+            errors.append(f"{label}.id_prefix is required")
+        else:
+            if prefix in seen_prefixes:
+                errors.append(f"{label}: duplicate id_prefix '{prefix}'")
+            seen_prefixes.add(prefix)
 
-    traits = study.get("traits")
-    if not isinstance(traits, list) or len(traits) == 0:
-        errors.append("pegasus.study.traits must be a non-empty list of trait names")
+        traits = study.get("traits")
+        if not isinstance(traits, list) or len(traits) == 0:
+            errors.append(f"{label}.traits must be a non-empty list of trait names")
+        else:
+            if prefix:
+                all_traits_by_study[prefix] = traits
 
     # Check that at least one locus source exists
     sources = config.get("data_sources", [])
@@ -58,6 +75,57 @@ def validate_pegasus_config(config: dict) -> list[str]:
             "role: locus_definition or role: gwas_sumstats. "
             "At least one locus source is required."
         )
+
+    # Cross-validate evidence.study and evidence.trait references
+    multiple_studies = len(studies) > 1
+    for src in sources:
+        evidence = src.get("evidence")
+        if not evidence:
+            continue
+        name = src.get("name", "<unnamed>")
+        role = evidence.get("role")
+
+        # evidence.study cross-validation
+        ev_study = evidence.get("study")
+        if ev_study:
+            if ev_study not in seen_prefixes:
+                errors.append(
+                    f"source '{name}': evidence.study '{ev_study}' "
+                    f"does not match any configured study id_prefix"
+                )
+        elif role in EVIDENCE_ROLES and multiple_studies:
+            errors.append(
+                f"source '{name}': evidence.study is required when multiple "
+                f"studies are configured (has role '{role}')"
+            )
+
+        # evidence.trait cross-validation
+        ev_trait = evidence.get("trait")
+        if ev_trait:
+            # Determine which study this source belongs to
+            ref_study = ev_study or (studies[0].get("id_prefix") if len(studies) == 1 else None)
+            if ref_study and ref_study in all_traits_by_study:
+                if ev_trait not in all_traits_by_study[ref_study]:
+                    errors.append(
+                        f"source '{name}': evidence.trait '{ev_trait}' "
+                        f"is not in study '{ref_study}' traits list"
+                    )
+
+        # gwas_sumstats requires evidence.trait
+        if role == "gwas_sumstats" and not ev_trait:
+            errors.append(
+                f"source '{name}': evidence.trait is required for gwas_sumstats "
+                f"(summary statistics are per-trait)"
+            )
+
+        # locus_definition without evidence.trait must have fields.trait mapping
+        if role == "locus_definition" and not ev_trait:
+            fields = evidence.get("fields", {})
+            if "trait" not in fields:
+                errors.append(
+                    f"source '{name}': locus_definition without evidence.trait "
+                    f"must have fields.trait mapping (trait from data column)"
+                )
 
     # Integration config (optional but validated if present)
     integration = pegasus.get("integration")
@@ -137,7 +205,11 @@ def validate_evidence_config(source: dict) -> list[str]:
     # Validate field mappings
     fields = evidence.get("fields", {})
     if role and role in REQUIRED_FIELDS:
-        missing = REQUIRED_FIELDS[role] - set(fields.keys())
+        required = set(REQUIRED_FIELDS[role])
+        # locus_definition: trait field mapping only required when evidence.trait is absent
+        if role == "locus_definition" and not evidence.get("trait"):
+            required.add("trait")
+        missing = required - set(fields.keys())
         if missing:
             errors.append(
                 f"source '{name}': evidence.fields missing required mappings "

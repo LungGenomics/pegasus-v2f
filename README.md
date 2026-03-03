@@ -55,7 +55,7 @@ See [schema/README.md](schema/README.md).
 
 ```bash
 # Clone and install
-git clone <repo-url> && cd pegasus-v2f
+git clone https://github.com/LungGenomics/pegasus-v2f.git && cd pegasus-v2f
 uv pip install -e cli/ -e api/
 
 # Initialize a project

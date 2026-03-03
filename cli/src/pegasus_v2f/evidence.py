@@ -18,13 +18,98 @@ logger = logging.getLogger(__name__)
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _create_studies(conn: Any, config: dict) -> list[str]:
-    """Idempotent: create one study row per trait from config.
+def _cleanup_locus_source(conn: Any, source_tag: str) -> None:
+    """Remove loci and evidence from a previous load of this source_tag.
+
+    Deletes locus_gene_evidence rows, then orphaned loci (loci with no
+    remaining evidence), then orphaned locus_gene_scores.
+    """
+    if is_postgres(conn):
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM locus_gene_evidence WHERE source_tag = %s",
+            (source_tag,),
+        )
+        cur.execute(
+            "DELETE FROM locus_gene_scores WHERE locus_id NOT IN "
+            "(SELECT DISTINCT locus_id FROM locus_gene_evidence)"
+        )
+        cur.execute(
+            "DELETE FROM loci WHERE locus_id NOT IN "
+            "(SELECT DISTINCT locus_id FROM locus_gene_evidence)"
+        )
+        conn.commit()
+        cur.close()
+    else:
+        conn.execute(
+            "DELETE FROM locus_gene_evidence WHERE source_tag = ?",
+            [source_tag],
+        )
+        conn.execute(
+            "DELETE FROM locus_gene_scores WHERE locus_id NOT IN "
+            "(SELECT DISTINCT locus_id FROM locus_gene_evidence)"
+        )
+        conn.execute(
+            "DELETE FROM loci WHERE locus_id NOT IN "
+            "(SELECT DISTINCT locus_id FROM locus_gene_evidence)"
+        )
+    logger.debug(f"Cleaned up previous evidence for source_tag '{source_tag}'")
+
+
+def _cleanup_gene_evidence(conn: Any, source_tag: str) -> None:
+    """Remove gene_evidence rows from a previous load of this source_tag."""
+    if is_postgres(conn):
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM gene_evidence WHERE source_tag = %s", (source_tag,)
+        )
+        conn.commit()
+        cur.close()
+    else:
+        conn.execute(
+            "DELETE FROM gene_evidence WHERE source_tag = ?", [source_tag]
+        )
+    logger.debug(f"Cleaned up previous gene_evidence for source_tag '{source_tag}'")
+
+
+def _resolve_study_config(source: dict, config: dict) -> dict:
+    """Resolve which study config a source belongs to.
+
+    Reads evidence.study from the source. If not set and exactly one study
+    exists, auto-selects it. If not set and multiple studies exist, raises.
+    """
+    from pegasus_v2f.config import get_study_list
+
+    studies = get_study_list(config)
+    ev_study = source.get("evidence", {}).get("study")
+
+    if ev_study:
+        for s in studies:
+            if s.get("id_prefix") == ev_study:
+                return s
+        raise ValueError(
+            f"Source '{source.get('name', '?')}' references study '{ev_study}' "
+            f"but no study with that id_prefix is configured"
+        )
+
+    if len(studies) == 1:
+        return studies[0]
+
+    if len(studies) == 0:
+        raise ValueError("No studies configured in pegasus.study")
+
+    raise ValueError(
+        f"Source '{source.get('name', '?')}' has no evidence.study field "
+        f"but {len(studies)} studies are configured. "
+        f"Set evidence.study to one of: {', '.join(s['id_prefix'] for s in studies)}"
+    )
+
+
+def _create_studies(conn: Any, study_cfg: dict) -> list[str]:
+    """Idempotent: create one study row per trait from a single study config dict.
 
     Returns list of study_ids created.
     """
-    pegasus = config["pegasus"]
-    study_cfg = pegasus["study"]
     prefix = study_cfg["id_prefix"]
     traits = study_cfg["traits"]
 
@@ -145,37 +230,55 @@ def load_locus_definition(
     evidence = source["evidence"]
     mapping = resolve_evidence_mapping(source, df)
     source_tag = evidence["source_tag"]
+
+    # Clean up previous load of this source before re-inserting
+    _cleanup_locus_source(conn, source_tag)
+
     window_kb = _get_locus_window_kb(config)
     merge_distance_kb = config.get("pegasus", {}).get(
         "locus_definition", {}
     ).get("merge_distance_kb", 250)
 
-    # Create studies from config traits list
-    study_ids = _create_studies(conn, config)
-    traits = config["pegasus"]["study"]["traits"]
-    prefix = config["pegasus"]["study"]["id_prefix"]
+    # Resolve which study this source belongs to
+    study_cfg = _resolve_study_config(source, config)
+    study_ids = _create_studies(conn, study_cfg)
+    traits = study_cfg["traits"]
+    prefix = study_cfg["id_prefix"]
+
+    # If evidence.trait is set, narrow to just that trait
+    ev_trait = evidence.get("trait")
+    if ev_trait:
+        traits = [ev_trait]
 
     # Map trait → study_id
     trait_to_study = {t: f"{prefix}_{t.lower()}" for t in traits}
 
     # Extract columns via mapping
     gene_col = mapping["gene"]
-    trait_col = mapping["trait"]
+    trait_col = mapping.get("trait")  # optional when evidence.trait is set
     chr_col = mapping["chromosome"]
     pos_col = mapping["position"]
     pval_col = mapping.get("pvalue")
     rsid_col = mapping.get("rsid")
+    sentinel_col = mapping.get("sentinel")
 
     # Filter to rows with valid traits
     df = df.copy()
-    df[trait_col] = df[trait_col].astype(str)
     valid_traits = set(traits)
-    df_valid = df[df[trait_col].isin(valid_traits)]
+
+    if ev_trait:
+        # All rows belong to the declared trait — inject synthetic trait column
+        trait_col = "__v2f_trait__"
+        df[trait_col] = ev_trait
+        df_valid = df
+    else:
+        df[trait_col] = df[trait_col].astype(str)
+        df_valid = df[df[trait_col].isin(valid_traits)]
 
     if len(df_valid) == 0:
+        col_info = f"Unique values in trait column: {df[trait_col].unique()[:10].tolist()}" if trait_col else ""
         logger.warning(
-            f"No rows match declared traits {traits}. "
-            f"Unique values in trait column: {df[trait_col].unique()[:10].tolist()}"
+            f"No rows match declared traits {traits}. {col_info}"
         )
         return {"studies": len(study_ids), "loci": 0, "evidence_rows": 0}
 
@@ -206,6 +309,7 @@ def load_locus_definition(
             trait_df, chr_col, pos_col, gene_col,
             window_kb=window_kb, merge_distance_kb=merge_distance_kb,
             pval_col=pval_col, rsid_col=rsid_col,
+            sentinel_col=sentinel_col,
         )
 
         for locus in loci:
@@ -219,6 +323,7 @@ def load_locus_definition(
                 chromosome=locus["chromosome"],
                 start_position=locus["start"],
                 end_position=locus["end"],
+                lead_variant_id=locus.get("lead_variant_id"),
                 lead_rsid=locus.get("lead_rsid"),
                 lead_pvalue=locus.get("lead_pvalue"),
                 locus_source="curated",
@@ -258,6 +363,7 @@ def _cluster_into_loci(
     window_kb: int, merge_distance_kb: int,
     pval_col: str | None = None,
     rsid_col: str | None = None,
+    sentinel_col: str | None = None,
 ) -> list[dict]:
     """Cluster rows into loci by genomic proximity.
 
@@ -290,12 +396,20 @@ def _cluster_into_loci(
         start = min(positions) - window
         end = max(positions) + window
 
+        # Extract lead variant ID from sentinel column (e.g. "1_1337837_A_G" → "1:1337837:A:G")
+        lead_variant_id = None
+        if sentinel_col and sentinel_col in remaining.columns and pd.notna(lead.get(sentinel_col)):
+            raw = str(lead[sentinel_col]).strip()
+            if raw:
+                lead_variant_id = raw.replace("_", ":")
+
         locus = {
             "chromosome": chrom,
             "start": max(0, start),
             "end": end,
             "lead_gene": genes[0] if genes else f"chr{chrom}_{pos}",
             "genes": genes,
+            "lead_variant_id": lead_variant_id,
             "lead_pvalue": float(lead[pval_col]) if pval_col and pd.notna(lead.get(pval_col)) else None,
             "lead_rsid": str(lead[rsid_col]) if rsid_col and rsid_col in remaining.columns and pd.notna(lead.get(rsid_col)) else None,
         }
@@ -430,14 +544,25 @@ def load_gwas_sumstats(
     evidence = source["evidence"]
     mapping = resolve_evidence_mapping(source, df)
     source_tag = evidence["source_tag"]
+
+    # Clean up previous load of this source before re-inserting
+    _cleanup_locus_source(conn, source_tag)
+
     pvalue_threshold = float(evidence.get("pvalue_threshold", 5e-8))
     clump_distance_kb = int(evidence.get("clump_distance_kb", 500))
     window_kb = _get_locus_window_kb(config)
 
-    # Create studies if needed
-    study_ids = _create_studies(conn, config)
-    traits = config["pegasus"]["study"]["traits"]
-    prefix = config["pegasus"]["study"]["id_prefix"]
+    # Resolve which study this source belongs to
+    study_cfg = _resolve_study_config(source, config)
+    study_ids = _create_studies(conn, study_cfg)
+    prefix = study_cfg["id_prefix"]
+
+    # gwas_sumstats uses evidence.trait to determine which trait
+    ev_trait = evidence.get("trait")
+    if ev_trait:
+        traits = [ev_trait]
+    else:
+        traits = study_cfg["traits"]
 
     # Extract columns
     chr_col = mapping["chromosome"]
@@ -624,6 +749,10 @@ def load_gene_evidence(conn: Any, source: dict, df: pd.DataFrame) -> dict:
     evidence = source["evidence"]
     mapping = resolve_evidence_mapping(source, df)
     source_tag = evidence["source_tag"]
+
+    # Clean up previous load of this source before re-inserting
+    _cleanup_gene_evidence(conn, source_tag)
+
     category = evidence["category"]
     evidence_type = evidence.get("evidence_type", category.lower())
 
@@ -631,6 +760,9 @@ def load_gene_evidence(conn: Any, source: dict, df: pd.DataFrame) -> dict:
     score_col = mapping.get("score")
     tissue_col = mapping.get("tissue")
     cell_type_col = mapping.get("cell_type")
+
+    # Trait-specific evidence (empty string = applies to all traits)
+    ev_trait = evidence.get("trait") or ""
 
     inserted = 0
     for _, row in df.iterrows():
@@ -648,10 +780,10 @@ def load_gene_evidence(conn: Any, source: dict, df: pd.DataFrame) -> dict:
                 cur.execute(
                     "INSERT INTO gene_evidence "
                     "(gene_symbol, evidence_category, evidence_type, source_tag, "
-                    "score, tissue, cell_type) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                    "trait, score, tissue, cell_type) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
                     "ON CONFLICT DO NOTHING",
-                    (gene, category, evidence_type, source_tag, score, tissue, cell_type),
+                    (gene, category, evidence_type, source_tag, ev_trait, score, tissue, cell_type),
                 )
                 conn.commit()
                 cur.close()
@@ -659,9 +791,9 @@ def load_gene_evidence(conn: Any, source: dict, df: pd.DataFrame) -> dict:
                 conn.execute(
                     "INSERT OR IGNORE INTO gene_evidence "
                     "(gene_symbol, evidence_category, evidence_type, source_tag, "
-                    "score, tissue, cell_type) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    [gene, category, evidence_type, source_tag, score, tissue, cell_type],
+                    "trait, score, tissue, cell_type) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [gene, category, evidence_type, source_tag, ev_trait, score, tissue, cell_type],
                 )
             inserted += 1
         except Exception as e:

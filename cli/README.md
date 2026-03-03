@@ -6,13 +6,9 @@ Command-line tool and pipeline engine for building PEGASUS gene prioritization d
 
 ```bash
 uv pip install -e cli/
-
-# Optional backends
-uv pip install -e "cli/[postgres]"    # PostgreSQL support
-uv pip install -e "cli/[sheets]"      # Google Sheets support
 ```
 
-This installs the `v2f` command on your PATH.
+This installs the `v2f` command on your PATH. Includes DuckDB, PostgreSQL, and Google Sheets support out of the box.
 
 ## Features
 
@@ -291,13 +287,9 @@ v2f init
 
 This creates `v2f.yaml` (config), `.v2f/` (local state), and `.gitignore`.
 
-### 2. Declare your GWAS study
+### 2. Add data sources
 
-Edit `v2f.yaml` to add a `pegasus:` section with your study metadata, traits, and integration criteria. See the full config example above.
-
-### 3. Add data sources
-
-Add sources either by editing `v2f.yaml` directly or using the CLI:
+Load your data as raw tables first — no YAML editing needed:
 
 ```bash
 # From a file
@@ -305,11 +297,42 @@ v2f add-source secretome --type file --path data/raw/secretome.tsv.gz
 
 # From Google Sheets
 v2f add-source trait_loci --type googlesheets --url "https://docs.google.com/..."
+
+# From Excel
+v2f add-source coloc_results --type excel --path data/raw/coloc.xlsx
 ```
 
-For evidence sources, add the `evidence:` block in `v2f.yaml` to map columns to PEGASUS categories.
+### 3. Inspect what you loaded
 
-### 4. Build the database
+```bash
+v2f tables
+v2f query "SELECT * FROM secretome LIMIT 5"
+```
+
+### 4. Map sources to PEGASUS evidence with the wizard
+
+The integration wizard walks you through mapping each raw table to the PEGASUS evidence model interactively:
+
+```bash
+v2f integrate secretome
+```
+
+The wizard will:
+1. Show the table's columns, types, and sample values
+2. Auto-suggest a PEGASUS category and field mappings based on column names
+3. Let you confirm or adjust each mapping
+4. Write the `evidence:` block into `v2f.yaml` for you
+5. Re-load through evidence routing, drop the raw table, and score
+
+Repeat for each source. Or if you prefer non-interactive mode:
+
+```bash
+v2f integrate secretome --category KNOW --centric gene --source-tag hpa_secretome
+```
+
+You can also edit `v2f.yaml` directly for more granular control — useful for advanced configuration or when working with an AI assistant that can generate the evidence mappings for you. See the [config format](#config-format) section below for the full schema.
+
+### 5. Build the database
 
 ```bash
 v2f build
@@ -317,7 +340,7 @@ v2f build
 
 This loads all sources, routes evidence, annotates genes, runs scoring, and creates the search index.
 
-### 5. Explore results
+### 6. Explore results
 
 ```bash
 # What tables do we have?
@@ -332,21 +355,6 @@ v2f query "SELECT * FROM locus_gene_evidence WHERE gene_symbol = 'HHIP'"
 # All predicted effector genes
 v2f query "SELECT * FROM locus_gene_scores WHERE is_predicted_effector = TRUE"
 ```
-
-### 6. Map raw tables to evidence
-
-If you loaded a source without an `evidence:` block, use the integration wizard:
-
-```bash
-v2f integrate extra_data
-```
-
-The wizard will:
-1. Show you the table's columns and sample values
-2. Suggest PEGASUS category and field mappings
-3. Let you confirm or adjust
-4. Write the `evidence:` block into `v2f.yaml`
-5. Re-load through evidence routing and score
 
 ### 7. Export PEGASUS deliverables
 

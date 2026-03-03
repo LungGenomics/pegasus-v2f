@@ -126,11 +126,12 @@ CREATE TABLE IF NOT EXISTS gene_evidence (
     evidence_category VARCHAR NOT NULL,
     evidence_type VARCHAR NOT NULL,
     source_tag VARCHAR NOT NULL,
+    trait VARCHAR NOT NULL DEFAULT '',
     score DOUBLE,
     tissue VARCHAR,
     cell_type VARCHAR,
     metadata JSON,
-    UNIQUE (gene_symbol, evidence_category, evidence_type, source_tag)
+    UNIQUE (gene_symbol, evidence_category, evidence_type, source_tag, trait)
 )
 """
 

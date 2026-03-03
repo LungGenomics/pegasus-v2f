@@ -32,11 +32,11 @@ def test_init_project_creates_structure(tmp_path):
     assert (root / ".gitignore").exists()
 
 
-def test_init_project_preserves_existing_config(tmp_path):
-    """init_project doesn't overwrite existing v2f.yaml."""
+def test_init_project_rejects_existing_project(tmp_path):
+    """init_project raises FileExistsError if v2f.yaml already exists."""
     dest = tmp_path / "existing"
     dest.mkdir()
     existing_config = dest / "v2f.yaml"
     existing_config.write_text("version: 99\n")
-    init_project(dest)
-    assert "version: 99" in existing_config.read_text()
+    with pytest.raises(FileExistsError, match="Already a v2f project"):
+        init_project(dest)

@@ -46,11 +46,21 @@ def get_connection(
         # DuckDB from config
         name = db_config.get("name", "gene.duckdb")
         db_path = base / ".v2f" / name
+        if read_only and not db_path.exists():
+            raise FileNotFoundError(
+                f"Database not found: {db_path}\n"
+                "Run 'v2f add-source' or 'v2f build' first to create the database."
+            )
         db_path.parent.mkdir(parents=True, exist_ok=True)
         return duckdb.connect(str(db_path), read_only=read_only)
 
     # Default fallback
     db_path = base / ".v2f" / "gene.duckdb"
+    if read_only and not db_path.exists():
+        raise FileNotFoundError(
+            f"Database not found: {db_path}\n"
+            "Run 'v2f add-source' or 'v2f build' first to create the database."
+        )
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return duckdb.connect(str(db_path), read_only=read_only)
 
@@ -151,7 +161,12 @@ def open_db(
         with open_db(db="gene.duckdb") as conn:
             conn.execute("SELECT 1")
     """
-    conn = get_connection(db=db, config=config, read_only=read_only, project_root=project_root)
+    try:
+        conn = get_connection(db=db, config=config, read_only=read_only, project_root=project_root)
+    except FileNotFoundError as e:
+        import sys
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     try:
         yield conn
     finally:

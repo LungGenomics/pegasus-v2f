@@ -38,7 +38,7 @@ def pegasus_db_path(tmp_path):
     config = {
         "version": 1,
         "pegasus": {
-            "study": {"id_prefix": "test", "traits": ["HEIGHT"]},
+            "study": [{"id_prefix": "test", "traits": ["HEIGHT"]}],
             "integration": {"method": "criteria_count_v1", "effector_threshold": 0.25, "criteria": []},
         },
     }
@@ -60,7 +60,7 @@ class TestMaterialize:
             "version: 1\n"
             "pegasus:\n"
             "  study:\n"
-            "    id_prefix: test\n"
+            "  - id_prefix: test\n"
             "    traits: [HEIGHT]\n"
             "  integration:\n"
             "    method: criteria_count_v1\n"

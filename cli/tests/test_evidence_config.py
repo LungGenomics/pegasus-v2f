@@ -20,7 +20,7 @@ class TestValidatePegasusConfig:
 
     def test_missing_id_prefix(self):
         config = {
-            "pegasus": {"study": {"traits": ["HEIGHT"]}},
+            "pegasus": {"study": [{"traits": ["HEIGHT"]}]},
             "data_sources": [
                 {"name": "s", "evidence": {"role": "locus_definition", "source_tag": "x",
                  "fields": {"gene": "g", "trait": "t", "chromosome": "c", "position": "p"}}}
@@ -31,7 +31,7 @@ class TestValidatePegasusConfig:
 
     def test_missing_traits(self):
         config = {
-            "pegasus": {"study": {"id_prefix": "test"}},
+            "pegasus": {"study": [{"id_prefix": "test"}]},
             "data_sources": [
                 {"name": "s", "evidence": {"role": "locus_definition", "source_tag": "x",
                  "fields": {"gene": "g", "trait": "t", "chromosome": "c", "position": "p"}}}
@@ -42,7 +42,7 @@ class TestValidatePegasusConfig:
 
     def test_empty_traits(self):
         config = {
-            "pegasus": {"study": {"id_prefix": "test", "traits": []}},
+            "pegasus": {"study": [{"id_prefix": "test", "traits": []}]},
             "data_sources": [
                 {"name": "s", "evidence": {"role": "locus_definition", "source_tag": "x",
                  "fields": {"gene": "g", "trait": "t", "chromosome": "c", "position": "p"}}}
@@ -54,7 +54,7 @@ class TestValidatePegasusConfig:
 
     def test_no_locus_source(self):
         config = {
-            "pegasus": {"study": {"id_prefix": "test", "traits": ["HEIGHT"]}},
+            "pegasus": {"study": [{"id_prefix": "test", "traits": ["HEIGHT"]}]},
             "data_sources": [
                 {"name": "s", "evidence": {"centric": "gene", "category": "KNOW",
                  "source_tag": "x", "fields": {"gene": "g"}}}
@@ -65,7 +65,7 @@ class TestValidatePegasusConfig:
 
     def test_valid_with_locus_definition(self):
         config = {
-            "pegasus": {"study": {"id_prefix": "test", "traits": ["HEIGHT"]}},
+            "pegasus": {"study": [{"id_prefix": "test", "traits": ["HEIGHT"]}]},
             "data_sources": [
                 {"name": "s", "evidence": {"role": "locus_definition", "source_tag": "x",
                  "fields": {"gene": "g", "trait": "t", "chromosome": "c", "position": "p"}}}
@@ -76,9 +76,10 @@ class TestValidatePegasusConfig:
 
     def test_valid_with_gwas_sumstats_only(self):
         config = {
-            "pegasus": {"study": {"id_prefix": "test", "traits": ["HEIGHT"]}},
+            "pegasus": {"study": [{"id_prefix": "test", "traits": ["HEIGHT"]}]},
             "data_sources": [
                 {"name": "ss", "evidence": {"role": "gwas_sumstats", "source_tag": "x",
+                 "trait": "HEIGHT",
                  "fields": {"chromosome": "c", "position": "p", "pvalue": "pv"}}}
             ],
         }
@@ -88,7 +89,7 @@ class TestValidatePegasusConfig:
     def test_invalid_integration_method(self):
         config = {
             "pegasus": {
-                "study": {"id_prefix": "test", "traits": ["HEIGHT"]},
+                "study": [{"id_prefix": "test", "traits": ["HEIGHT"]}],
                 "integration": {"method": "unknown_method"},
             },
             "data_sources": [
@@ -236,7 +237,7 @@ class TestConfigIntegration:
 
         config = {
             "version": 1,
-            "pegasus": {"study": {"id_prefix": "test", "traits": ["H"]}},
+            "pegasus": {"study": [{"id_prefix": "test", "traits": ["H"]}]},
             "data_sources": [
                 {"name": "s", "source_type": "file",
                  "evidence": {"role": "invalid_role"}},

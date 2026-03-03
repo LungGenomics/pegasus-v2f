@@ -44,7 +44,7 @@ def add_source(
     # Check if source already exists
     existing = list_sources(conn)
     if any(s["name"] == name for s in existing):
-        raise ValueError(f"Source '{name}' already exists. Use update_source to replace it.")
+        raise ValueError(f"Source '{name}' already exists. Use --force to replace it.")
 
     # Load and transform
     df = load_source(source, data_dir=data_dir)
@@ -71,7 +71,10 @@ def add_source(
 
     # Update source_metadata table (only for raw sources)
     if not evidence:
-        _upsert_source_metadata(conn, source, len(df))
+        try:
+            _upsert_source_metadata(conn, source, len(df))
+        except Exception:
+            pass  # source_metadata may not exist outside full builds
 
     logger.info(f"Added source '{name}': {len(df)} rows")
     return len(df)
@@ -121,7 +124,10 @@ def update_source(
     else:
         # Replace raw table
         write_table(conn, name, df)
-        _upsert_source_metadata(conn, source, len(df))
+        try:
+            _upsert_source_metadata(conn, source, len(df))
+        except Exception:
+            pass  # source_metadata may not exist outside full builds
 
     logger.info(f"Updated source '{name}': {len(df)} rows")
     return len(df)
@@ -140,8 +146,14 @@ def remove_source(conn: Any, name: str, config: dict | None = None) -> None:
     evidence = source.get("evidence") if source else None
     if evidence:
         source_tag = evidence.get("source_tag", "")
+        role = evidence.get("role")
+
         if source_tag:
             _delete_evidence_by_source_tag(conn, source_tag)
+
+            # Locus definition sources also create studies, loci, and scores
+            if role == "locus_definition":
+                _delete_locus_definition_data(conn, source_tag)
 
             # Remove from data_sources provenance table
             if is_postgres(conn):
@@ -188,6 +200,47 @@ def list_sources(conn: Any) -> list[dict]:
     return config.get("data_sources", [])
 
 
+def _delete_locus_definition_data(conn: Any, source_tag: str) -> None:
+    """Delete orphaned loci, scores, and studies after evidence rows were removed.
+
+    Called after _delete_evidence_by_source_tag has already removed the
+    locus_gene_evidence rows.  This cleans up loci that no longer have any
+    evidence, their scores, and studies with no remaining loci.
+    """
+    try:
+        if is_postgres(conn):
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM locus_gene_scores WHERE locus_id NOT IN "
+                "(SELECT DISTINCT locus_id FROM locus_gene_evidence)"
+            )
+            cur.execute(
+                "DELETE FROM loci WHERE locus_id NOT IN "
+                "(SELECT DISTINCT locus_id FROM locus_gene_evidence)"
+            )
+            cur.execute(
+                "DELETE FROM studies WHERE study_id NOT IN "
+                "(SELECT DISTINCT study_id FROM loci)"
+            )
+            conn.commit()
+            cur.close()
+        else:
+            conn.execute(
+                "DELETE FROM locus_gene_scores WHERE locus_id NOT IN "
+                "(SELECT DISTINCT locus_id FROM locus_gene_evidence)"
+            )
+            conn.execute(
+                "DELETE FROM loci WHERE locus_id NOT IN "
+                "(SELECT DISTINCT locus_id FROM locus_gene_evidence)"
+            )
+            conn.execute(
+                "DELETE FROM studies WHERE study_id NOT IN "
+                "(SELECT DISTINCT study_id FROM loci)"
+            )
+    except Exception:
+        pass  # Tables may not exist
+
+
 def _delete_evidence_by_source_tag(conn: Any, source_tag: str) -> None:
     """Delete evidence rows from both evidence tables for a given source_tag."""
     if is_postgres(conn):
@@ -219,6 +272,24 @@ def _append_source_to_meta(conn: Any, source: dict) -> None:
 
     config.setdefault("data_sources", [])
     config["data_sources"].append(source)
+
+    write_meta(conn, "config", yaml.dump(config, default_flow_style=False, sort_keys=False))
+
+
+def update_source_in_meta(conn: Any, name: str, updates: dict) -> None:
+    """Merge fields into a source entry in _pegasus_meta by name.
+
+    Used by integrate to sync the evidence block back to the embedded config.
+    """
+    config_yaml = read_meta(conn, "config")
+    if not config_yaml:
+        return
+
+    config = yaml.safe_load(config_yaml)
+    for source in config.get("data_sources", []):
+        if source.get("name") == name:
+            source.update(updates)
+            break
 
     write_meta(conn, "config", yaml.dump(config, default_flow_style=False, sort_keys=False))
 

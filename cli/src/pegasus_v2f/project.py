@@ -36,6 +36,10 @@ def init_project(dest: Path | str, url: str | None = None) -> Path:
         # Clone the repo
         subprocess.run(["git", "clone", url, str(dest)], check=True)
     else:
+        if (dest / "v2f.yaml").exists():
+            raise FileExistsError(
+                f"Already a v2f project: {dest}"
+            )
         dest.mkdir(parents=True, exist_ok=True)
 
     # Create .v2f/ directory

@@ -17,9 +17,11 @@ logger = logging.getLogger(__name__)
 # Common column name patterns → suggested PEGASUS field mappings
 _COLUMN_SUGGESTIONS: dict[str, list[str]] = {
     "gene": ["gene", "gene_symbol", "gene_name", "symbol", "hgnc"],
-    "pvalue": ["pvalue", "p_value", "p.value", "minp", "pval", "p"],
+    "trait": ["trait", "phenotype", "pheno"],
+    "pvalue": ["pvalue", "p_value", "p.value", "minp", "pval", "p", "min_p"],
     "chromosome": ["chr", "chromosome", "chrom"],
     "position": ["pos", "position", "bp", "start"],
+    "sentinel": ["sentinel", "lead_variant", "lead_snp", "index_variant", "index_snp"],
     "rsid": ["rsid", "rs", "snp", "variant_id"],
     "effect_size": ["beta", "effect_size", "effect", "log_or", "or"],
     "score": ["score", "pip", "pph4", "h4", "posterior_prob"],
@@ -117,10 +119,20 @@ def suggest_mappings(
     has_position = "chromosome" in fields and "position" in fields
     centric = "variant" if has_position else "gene"
 
+    # Guess role: if source has trait + chr + pos columns, likely a locus source
+    role = None
+    if "trait" in fields and has_position:
+        name_lower = source_name.lower()
+        if "sumstat" in name_lower or "summary" in name_lower:
+            role = "gwas_sumstats"
+        else:
+            role = "locus_definition"
+
     return {
         "fields": fields,
         "category": category,
         "centric": centric,
+        "role": role,
     }
 
 
@@ -128,12 +140,32 @@ def validate_mapping(mapping: dict) -> list[str]:
     """Validate a proposed evidence mapping.
 
     Args:
-        mapping: dict with keys: category, centric, source_tag, fields
+        mapping: dict with keys: role OR (category, centric), plus source_tag, fields
 
     Returns:
         List of error strings (empty = valid).
     """
     errors = []
+
+    role = mapping.get("role")
+    if role:
+        if role not in ("locus_definition", "gwas_sumstats"):
+            errors.append(f"Unknown role '{role}'. Must be 'locus_definition' or 'gwas_sumstats'")
+
+        if not mapping.get("source_tag"):
+            errors.append("source_tag is required")
+
+        fields = mapping.get("fields", {})
+        if not fields.get("gene"):
+            errors.append("Field mapping for 'gene' is required")
+        if not fields.get("chromosome"):
+            errors.append("Locus source requires 'chromosome' field")
+        if not fields.get("position"):
+            errors.append("Locus source requires 'position' field")
+        if role == "locus_definition" and not fields.get("trait"):
+            errors.append("Locus definition requires 'trait' field")
+
+        return errors
 
     category = mapping.get("category")
     if not category:
@@ -194,14 +226,27 @@ def apply_integration(
     from pegasus_v2f.transform import apply_transformations, clean_for_db
 
     # Build evidence block
-    evidence_block = {
-        "category": mapping["category"],
-        "centric": mapping["centric"],
-        "source_tag": mapping["source_tag"],
-        "fields": mapping["fields"],
-    }
-    if mapping.get("evidence_type"):
-        evidence_block["evidence_type"] = mapping["evidence_type"]
+    if mapping.get("role"):
+        evidence_block = {
+            "role": mapping["role"],
+            "source_tag": mapping["source_tag"],
+            "fields": mapping["fields"],
+        }
+    else:
+        evidence_block = {
+            "category": mapping["category"],
+            "centric": mapping["centric"],
+            "source_tag": mapping["source_tag"],
+            "fields": mapping["fields"],
+        }
+        if mapping.get("evidence_type"):
+            evidence_block["evidence_type"] = mapping["evidence_type"]
+
+    # Add study and trait if present
+    if mapping.get("study"):
+        evidence_block["study"] = mapping["study"]
+    if mapping.get("trait"):
+        evidence_block["trait"] = mapping["trait"]
 
     # Find the source in config
     sources = config.get("data_sources", [])
@@ -231,8 +276,17 @@ def apply_integration(
     import pandas as pd
     df = pd.DataFrame(rows, columns=cols)
 
+    # Ensure PEGASUS schema exists (tables may not exist if DB was built
+    # with only raw sources and no `v2f build`)
+    from pegasus_v2f.pegasus_schema import create_pegasus_schema
+    create_pegasus_schema(conn)
+
     # Route through evidence loader
     load_result = route_evidence_source(conn, source_with_evidence, df, config)
+
+    # Sync evidence block to _pegasus_meta so remove-source can find it
+    from pegasus_v2f.sources import update_source_in_meta
+    update_source_in_meta(conn, source_name, {"evidence": evidence_block})
 
     # Drop the raw table
     conn.execute(f'DROP TABLE IF EXISTS "{source_name}"')
@@ -252,7 +306,10 @@ def apply_integration(
         "raw_table_dropped": True,
         "scores_computed": n_scored,
     }
-    logger.info(f"Integrated '{source_name}' as {mapping['category']} ({mapping['centric']})")
+    if mapping.get("role"):
+        logger.info(f"Integrated '{source_name}' as {mapping['role']}")
+    else:
+        logger.info(f"Integrated '{source_name}' as {mapping['category']} ({mapping['centric']})")
     return summary
 
 
@@ -291,6 +348,7 @@ def _update_yaml_evidence_block(
 
     # Find the end of this source block (next "- name:" at same indent or end of list)
     insert_idx = source_line_idx + 1
+    last_prop_idx = source_line_idx  # track last non-blank property line
     while insert_idx < len(lines):
         line = lines[insert_idx]
         stripped = line.strip()
@@ -298,10 +356,8 @@ def _update_yaml_evidence_block(
             insert_idx += 1
             continue
         line_indent = len(line) - len(line.lstrip())
-        # Another list item at same level or less indent = end of this source
-        if line_indent <= base_indent and stripped.startswith("- "):
-            break
-        if line_indent < base_indent:
+        # End of this source block: any line at base indent or less
+        if line_indent <= base_indent:
             break
         # Check if evidence block already exists
         if stripped.startswith("evidence:"):
@@ -319,8 +375,13 @@ def _update_yaml_evidence_block(
                     break
                 end_ev += 1
             del lines[insert_idx:end_ev]
+            last_prop_idx = insert_idx - 1
             break
+        last_prop_idx = insert_idx
         insert_idx += 1
+
+    # Insert right after the last property line (not after trailing blank lines)
+    insert_idx = last_prop_idx + 1
 
     # Build evidence YAML lines
     indent = " " * prop_indent
@@ -328,8 +389,15 @@ def _update_yaml_evidence_block(
     field_indent = " " * (prop_indent + 4)
 
     ev_lines = [f"{indent}evidence:"]
-    ev_lines.append(f"{sub_indent}category: {evidence_block['category']}")
-    ev_lines.append(f"{sub_indent}centric: {evidence_block['centric']}")
+    if evidence_block.get("role"):
+        ev_lines.append(f"{sub_indent}role: {evidence_block['role']}")
+    else:
+        ev_lines.append(f"{sub_indent}category: {evidence_block['category']}")
+        ev_lines.append(f"{sub_indent}centric: {evidence_block['centric']}")
+    if evidence_block.get("study"):
+        ev_lines.append(f"{sub_indent}study: {evidence_block['study']}")
+    if evidence_block.get("trait"):
+        ev_lines.append(f"{sub_indent}trait: {evidence_block['trait']}")
     ev_lines.append(f"{sub_indent}source_tag: {evidence_block['source_tag']}")
     if evidence_block.get("evidence_type"):
         ev_lines.append(f"{sub_indent}evidence_type: {evidence_block['evidence_type']}")

@@ -27,12 +27,14 @@ def pconn():
 
 BASIC_CONFIG = {
     "pegasus": {
-        "study": {
-            "id_prefix": "test_2024",
-            "gwas_source": "PMID:00000001",
-            "ancestry": "European",
-            "traits": ["HEIGHT", "WEIGHT"],
-        },
+        "study": [
+            {
+                "id_prefix": "test_2024",
+                "gwas_source": "PMID:00000001",
+                "ancestry": "European",
+                "traits": ["HEIGHT", "WEIGHT"],
+            },
+        ],
         "locus_definition": {
             "window_kb": 500,
             "merge_distance_kb": 250,
@@ -41,16 +43,19 @@ BASIC_CONFIG = {
 }
 
 
+BASIC_STUDY_CFG = BASIC_CONFIG["pegasus"]["study"][0]
+
+
 class TestCreateStudies:
     def test_creates_studies(self, pconn):
-        ids = _create_studies(pconn, BASIC_CONFIG)
+        ids = _create_studies(pconn, BASIC_STUDY_CFG)
         assert set(ids) == {"test_2024_height", "test_2024_weight"}
         rows = pconn.execute("SELECT study_id, trait FROM studies ORDER BY study_id").fetchall()
         assert len(rows) == 2
 
     def test_idempotent(self, pconn):
-        _create_studies(pconn, BASIC_CONFIG)
-        _create_studies(pconn, BASIC_CONFIG)
+        _create_studies(pconn, BASIC_STUDY_CFG)
+        _create_studies(pconn, BASIC_STUDY_CFG)
         rows = pconn.execute("SELECT COUNT(*) FROM studies").fetchone()
         assert rows[0] == 2
 
