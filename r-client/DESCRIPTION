@@ -1,0 +1,21 @@
+Package: pegasus.v2f
+Title: R Client for PEGASUS V2F Gene Prioritization Databases
+Version: 0.1.0
+Authors@R: person("Sam", "Sheffield", role = c("aut", "cre"),
+    email = "ssheffi1@jhu.edu")
+Description: Read-only R client for querying PEGASUS V2F gene prioritization
+    databases. Connects to DuckDB or PostgreSQL databases built by the v2f
+    Python CLI and returns data frames. Provides domain-first functions for
+    searching genes, browsing evidence, and exploring GWAS loci.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
+Imports:
+    DBI,
+    duckdb
+Suggests:
+    RPostgres,
+    yaml,
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
