@@ -1,0 +1,297 @@
+"""Build pipeline — orchestrates loading, transforming, and writing data."""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from pegasus_v2f.config import (
+    config_to_yaml,
+    get_data_sources,
+    get_database_config,
+)
+from pegasus_v2f.db import is_postgres, write_table
+from pegasus_v2f.db_meta import write_build_meta
+from pegasus_v2f.db_schema import create_schema, has_tables, drop_all_tables
+from pegasus_v2f.loaders import load_source
+from pegasus_v2f.transform import apply_transformations, clean_for_db
+from pegasus_v2f.annotate import (
+    create_gene_annotations,
+    create_search_index,
+    create_gene_table_summary,
+    create_pegasus_search_index,
+    create_gene_evidence_summary,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def build_db(
+    conn: Any,
+    config: dict,
+    project_root: Path | None = None,
+    overwrite: bool = False,
+) -> dict:
+    """Build the entire database from config.
+
+    Args:
+        conn: Open database connection.
+        config: Resolved config dict.
+        project_root: Project root for resolving relative paths.
+        overwrite: If True, drop all tables first. If False, fail on non-empty DB.
+
+    Returns:
+        Summary dict with counts and status.
+    """
+    # Check if DB already has tables
+    if has_tables(conn):
+        if overwrite:
+            logger.info("Overwrite mode — dropping all existing tables")
+            drop_all_tables(conn)
+        else:
+            raise RuntimeError(
+                "Database already has tables. Use --overwrite to rebuild, "
+                "or use add-source to append."
+            )
+
+    # Create core schema (+ PEGASUS tables if config has pegasus: section)
+    create_schema(conn, config=config)
+
+    # Resolve data directory
+    data_dir = None
+    if project_root:
+        data_dir = Path(project_root) / "data" / "raw"
+        if not data_dir.exists():
+            data_dir = Path(project_root)
+
+    # Process data sources
+    sources = get_data_sources(config)
+    is_pegasus = bool(config.get("pegasus"))
+
+    if is_pegasus:
+        loaded_tables, all_genes, metadata_rows = process_data_sources_pegasus(
+            conn, sources, data_dir, config
+        )
+    else:
+        loaded_tables, all_genes, metadata_rows = process_data_sources(
+            conn, sources, data_dir
+        )
+
+    # Write source metadata (legacy — only for non-pegasus builds)
+    if metadata_rows:
+        meta_df = pd.DataFrame(metadata_rows)
+        write_table(conn, "source_metadata", meta_df)
+
+    # Gene annotations
+    if all_genes:
+        logger.info(f"Creating gene annotations for {len(all_genes)} genes")
+        create_gene_annotations(conn, list(all_genes), config)
+    else:
+        logger.warning("No genes found — skipping annotations")
+
+    if is_pegasus:
+        # Scoring
+        from pegasus_v2f.scoring import compute_locus_gene_scores
+        n_scored = compute_locus_gene_scores(conn, config)
+        logger.info(f"Scored {n_scored} locus-gene pairs")
+
+        # PEGASUS search index (from evidence tables)
+        create_pegasus_search_index(conn)
+
+        # Gene evidence summary
+        create_gene_evidence_summary(conn)
+    else:
+        # Legacy search index (from raw source tables)
+        create_search_index(conn, sources, loaded_tables, config)
+
+        # Legacy gene table summary
+        create_gene_table_summary(conn, sources, loaded_tables)
+
+    # Write build metadata
+    db_config = get_database_config(config)
+    genome_build = db_config.get("genome_build", "hg38")
+    write_build_meta(conn, config_to_yaml(config), genome_build=genome_build)
+
+    return {
+        "sources_loaded": len(loaded_tables),
+        "sources_total": len(sources),
+        "genes_found": len(all_genes),
+        "tables": loaded_tables,
+    }
+
+
+def process_data_sources_pegasus(
+    conn: Any,
+    sources: list[dict],
+    data_dir: Path | None,
+    config: dict,
+) -> tuple[list[str], set[str], list[dict]]:
+    """PEGASUS-aware multi-pass data source processing.
+
+    Pass 1: Locus sources (locus_definition first, then gwas_sumstats)
+    Pass 2: Other evidence sources (gene-centric, variant-centric)
+    Pass 3: Raw sources (no evidence block → exploration tables)
+
+    Returns:
+        (loaded_table_names, all_gene_symbols, metadata_rows_for_raw_only)
+    """
+    from pegasus_v2f.evidence import route_evidence_source
+
+    loaded_tables = []
+    all_genes: set[str] = set()
+    metadata_rows = []  # only for raw (non-evidence) sources
+
+    # Categorize sources
+    locus_def_sources = []
+    sumstats_sources = []
+    other_evidence_sources = []
+    raw_sources = []
+
+    for source in sources:
+        evidence = source.get("evidence")
+        if not evidence:
+            raw_sources.append(source)
+        elif evidence.get("role") == "locus_definition":
+            locus_def_sources.append(source)
+        elif evidence.get("role") == "gwas_sumstats":
+            sumstats_sources.append(source)
+        else:
+            other_evidence_sources.append(source)
+
+    # Pass 1a: Locus definition sources
+    for source in locus_def_sources:
+        name = source["name"]
+        logger.info(f"Pass 1a (locus_definition): {name}")
+        try:
+            df = _load_and_transform(source, data_dir)
+            result = route_evidence_source(conn, source, df, config)
+            loaded_tables.append(name)
+            all_genes.update(_collect_genes(df))
+            if result:
+                logger.info(f"  {result}")
+        except Exception as e:
+            logger.error(f"  Failed: {e}")
+
+    # Pass 1b: GWAS sumstats sources
+    for source in sumstats_sources:
+        name = source["name"]
+        logger.info(f"Pass 1b (gwas_sumstats): {name}")
+        try:
+            df = _load_and_transform(source, data_dir)
+            result = route_evidence_source(conn, source, df, config)
+            loaded_tables.append(name)
+            all_genes.update(_collect_genes(df))
+            if result:
+                logger.info(f"  {result}")
+        except Exception as e:
+            logger.error(f"  Failed: {e}")
+
+    # Pass 2: Other evidence sources
+    for source in other_evidence_sources:
+        name = source["name"]
+        logger.info(f"Pass 2 (evidence): {name}")
+        try:
+            df = _load_and_transform(source, data_dir)
+            result = route_evidence_source(conn, source, df, config)
+            loaded_tables.append(name)
+            all_genes.update(_collect_genes(df))
+            if result:
+                logger.info(f"  {result}")
+        except Exception as e:
+            logger.error(f"  Failed: {e}")
+
+    # Pass 3: Raw sources (exploration only)
+    for source in raw_sources:
+        name = source["name"]
+        logger.info(f"Pass 3 (raw): {name}")
+        try:
+            df = _load_and_transform(source, data_dir)
+            write_table(conn, name, df)
+            loaded_tables.append(name)
+            all_genes.update(_collect_genes(df))
+            metadata_rows.append({
+                "table_name": name,
+                "display_name": source.get("display_name", name),
+                "description": source.get("description", ""),
+                "data_type": source.get("data_type", ""),
+                "source_type": source.get("source_type", ""),
+                "gene_column": "gene" if "gene" in df.columns else "",
+                "unique_per_gene": source.get("unique_per_gene", True),
+                "include_in_search": source.get("include_in_search", True),
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+            })
+            logger.info(f"  Loaded raw table: {len(df)} rows")
+        except Exception as e:
+            logger.error(f"  Failed: {e}")
+
+    return loaded_tables, all_genes, metadata_rows
+
+
+def process_data_sources(
+    conn: Any,
+    sources: list[dict],
+    data_dir: Path | None,
+) -> tuple[list[str], set[str], list[dict]]:
+    """Legacy (non-PEGASUS) source processing — load each as a raw table.
+
+    Returns:
+        (loaded_table_names, all_gene_symbols, metadata_rows)
+    """
+    loaded_tables = []
+    all_genes: set[str] = set()
+    metadata_rows = []
+
+    for source in sources:
+        name = source["name"]
+        logger.info(f"Processing source: {name}")
+
+        try:
+            df = _load_and_transform(source, data_dir)
+
+            all_genes.update(_collect_genes(df))
+
+            write_table(conn, name, df)
+            loaded_tables.append(name)
+
+            metadata_rows.append({
+                "table_name": name,
+                "display_name": source.get("display_name", name),
+                "description": source.get("description", ""),
+                "data_type": source.get("data_type", ""),
+                "source_type": source.get("source_type", ""),
+                "gene_column": "gene" if "gene" in df.columns else "",
+                "unique_per_gene": source.get("unique_per_gene", True),
+                "include_in_search": source.get("include_in_search", True),
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+            })
+
+            logger.info(f"  Loaded {name}: {len(df)} rows, {len(df.columns)} columns")
+
+        except Exception as e:
+            logger.error(f"  Failed to load {name}: {e}")
+            continue
+
+    return loaded_tables, all_genes, metadata_rows
+
+
+def _load_and_transform(source: dict, data_dir: Path | None) -> pd.DataFrame:
+    """Load a source and apply transformations + column cleaning."""
+    df = load_source(source, data_dir=data_dir)
+    transformations = source.get("transformations", [])
+    if transformations:
+        df = apply_transformations(df, transformations)
+    df = clean_for_db(df)
+    return df
+
+
+def _collect_genes(df: pd.DataFrame) -> set[str]:
+    """Extract unique gene symbols from a DataFrame."""
+    if "gene" in df.columns:
+        return {str(g) for g in df["gene"].dropna().unique() if g and str(g) != "nan"}
+    return set()
+
+

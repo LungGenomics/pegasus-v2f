@@ -1,0 +1,9 @@
+# v2f local state
+.v2f/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# OS
+.DS_Store

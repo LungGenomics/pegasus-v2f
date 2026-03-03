@@ -1,0 +1,8 @@
+version: 1
+
+database:
+  backend: duckdb
+  genome_build: hg38
+  name: gene.duckdb
+
+data_sources: []

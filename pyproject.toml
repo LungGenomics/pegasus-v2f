@@ -1,0 +1,10 @@
+[project]
+name = "v2f"
+version = "0.0.0"
+requires-python = ">=3.11"
+
+[tool.uv.workspace]
+members = ["cli", "api"]
+
+[tool.uv.sources]
+pegasus-v2f = { workspace = true }
