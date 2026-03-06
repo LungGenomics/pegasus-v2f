@@ -10,7 +10,7 @@ from typing import Any
 import yaml
 
 from pegasus_v2f.db import is_postgres, raw_table_name
-from pegasus_v2f.pegasus_schema import EVIDENCE_CATEGORIES
+from pegasus_v2f.pegasus_schema import EVIDENCE_CATEGORIES, EVIDENCE_CATEGORY_PROFILES
 
 logger = logging.getLogger(__name__)
 
@@ -28,21 +28,34 @@ _COLUMN_SUGGESTIONS: dict[str, list[str]] = {
     "tissue": ["tissue", "cell_type", "tissue_name"],
 }
 
-# Category suggestions based on source name patterns
-_NAME_CATEGORY_HINTS: dict[str, str] = {
-    "coloc": "COLOC",
-    "eqtl": "QTL",
-    "sqtl": "QTL",
-    "pqtl": "QTL",
-    "qtl": "QTL",
-    "gwas": "GWAS",
-    "deg": "EXP",
-    "expression": "EXP",
-    "secretome": "KNOW",
-    "drug": "DRUG",
-    "omim": "RARE",
-    "clinvar": "RARE",
-}
+# Category suggestions derived from CategoryProfile.source_name_hints
+_NAME_CATEGORY_HINTS: dict[str, str] = {}
+for _abbrev, _profile in EVIDENCE_CATEGORY_PROFILES.items():
+    for _hint in _profile.source_name_hints:
+        if _hint not in _NAME_CATEGORY_HINTS:
+            _NAME_CATEGORY_HINTS[_hint] = _abbrev
+
+
+def detect_columns_from_df(df) -> list[dict]:
+    """Build column info dicts from a DataFrame.
+
+    Returns list of dicts with keys: name, type, sample_values.
+    Same output format as detect_columns() but works without a DB.
+    """
+    import pandas as pd
+
+    columns = []
+    for col in df.columns:
+        samples = [str(v) for v in df[col].dropna().head(3).tolist()]
+        col_type = "text"
+        if samples:
+            try:
+                [float(s) for s in samples]
+                col_type = "numeric"
+            except ValueError:
+                pass
+        columns.append({"name": col, "type": col_type, "sample_values": samples})
+    return columns
 
 
 def detect_columns(conn: Any, table_name: str) -> list[dict]:
@@ -110,11 +123,24 @@ def suggest_mappings(
 
     # Guess category from source name
     category = None
+    category_source = None
     name_lower = source_name.lower()
     for hint, cat in _NAME_CATEGORY_HINTS.items():
         if hint in name_lower:
             category = cat
+            category_source = "name"
             break
+
+    # If no category from name, try matching column names against profile hints
+    if not category:
+        for col_lower in col_names_lower:
+            for abbrev, profile in EVIDENCE_CATEGORY_PROFILES.items():
+                if any(h in col_lower for h in profile.column_hints):
+                    category = abbrev
+                    category_source = "column"
+                    break
+            if category:
+                break
 
     # Guess centric: if we found chromosome/position → variant, else gene
     has_position = "chromosome" in fields and "position" in fields

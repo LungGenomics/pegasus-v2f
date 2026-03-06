@@ -59,8 +59,11 @@ class TestExportEvidenceMatrix:
             header = f.readline().strip().split("\t")
         assert "locus_id" in header
         assert "gene_symbol" in header
-        assert "GWAS" in header
-        assert "COLOC" in header
+        assert "locus_range" in header
+        assert "ensembl_gene_id" in header
+        # Evidence columns use Category_sourceTag format
+        assert "GWAS_src1" in header
+        assert "COLOC_src2" in header
 
     def test_row_count(self, export_db, tmp_path):
         path = export_evidence_matrix(export_db, ["s1"], tmp_path)
@@ -79,14 +82,14 @@ class TestExportMetadata:
         path = export_metadata(export_db, ["s1"], tmp_path)
         assert path.exists()
         meta = yaml.safe_load(path.read_text())
-        assert "HEIGHT" in meta["study"]["traits"]
-        assert meta["n_loci"] == 2
+        assert "HEIGHT" in meta["dataset"]["traits"]
+        assert meta["genomic"]["n_loci"] == 2
         assert "GWAS" in meta["evidence_categories"]
 
     def test_includes_data_sources(self, export_db, tmp_path):
         path = export_metadata(export_db, ["s1"], tmp_path)
         meta = yaml.safe_load(path.read_text())
-        assert len(meta["data_sources"]) == 2
+        assert len(meta["sources"]) == 2
 
 
 class TestExportPegList:

@@ -102,33 +102,69 @@ def export_evidence_matrix(conn: Any, study_ids: list[str], output_dir: Path) ->
             lparams,
         ).fetchall()
 
-    evidence_cols = sorted({row[2] for row in se_rows if row[2]})
+    # Build evidence column names: Category_sourceTag (PEGASUS standard naming)
+    evidence_col_keys = sorted({(row[2], row[3]) for row in se_rows if row[2]})
     locus_lookup = {l[0]: l for l in loci}
 
     evidence_map: dict[tuple[str, str], dict] = {}
     for row in se_rows:
-        locus_id, gene, category = row[0], row[1], row[2]
+        locus_id, gene, category, source_tag = row[0], row[1], row[2], row[3]
         pvalue, score = row[4], row[5]
         if not category:
             continue
         key = (locus_id, gene)
         if key not in evidence_map:
             evidence_map[key] = {}
+        col_name = f"{category}_{source_tag}" if source_tag else category
         value = score if score is not None else (pvalue if pvalue is not None else 1)
-        evidence_map[key][category] = value
+        evidence_map[key][col_name] = value
+
+    evidence_cols = sorted({col for ev_dict in evidence_map.values() for col in ev_dict})
+
+    # Lookup tables for variant/gene IDs
+    _lead_variants = {}
+    for l in loci:
+        _lead_variants[l[0]] = l  # locus_id -> full locus row
+
+    # Try to get Ensembl gene IDs
+    gene_ids: dict[str, str] = {}
+    try:
+        if is_postgres(conn):
+            cur = conn.cursor()
+            cur.execute("SELECT gene_symbol, ensembl_gene_id FROM genes WHERE ensembl_gene_id IS NOT NULL")
+            gene_ids = {r[0]: r[1] for r in cur.fetchall()}
+            cur.close()
+        else:
+            gene_ids = {
+                r[0]: r[1] for r in conn.execute(
+                    "SELECT gene_symbol, ensembl_gene_id FROM genes WHERE ensembl_gene_id IS NOT NULL"
+                ).fetchall()
+            }
+    except Exception:
+        pass  # genes table may be empty
+
+    # Try to get lead variant info from loci
+    loci_variants: dict[str, tuple] = {}
+    for l in loci:
+        locus_id = l[0]
+        loci_variants[locus_id] = l  # full row
 
     matrix_rows = []
     for (locus_id, gene), ev_dict in evidence_map.items():
         locus = locus_lookup.get(locus_id)
         if not locus:
             continue
+        # Format locus range as chr:start-end (PEGASUS standard)
+        locus_range = f"{locus[2]}:{locus[3]}-{locus[4]}"
         row_dict = {
             "locus_id": locus_id,
             "locus_name": locus[1],
+            "locus_range": locus_range,
             "chromosome": locus[2],
             "start": locus[3],
             "end": locus[4],
             "gene_symbol": gene,
+            "ensembl_gene_id": gene_ids.get(gene, ""),
         }
         for col in evidence_cols:
             row_dict[col] = ev_dict.get(col, "")
@@ -136,7 +172,10 @@ def export_evidence_matrix(conn: Any, study_ids: list[str], output_dir: Path) ->
 
     df = pd.DataFrame(matrix_rows)
     if len(df) == 0:
-        df = pd.DataFrame(columns=["locus_id", "locus_name", "chromosome", "start", "end", "gene_symbol"])
+        df = pd.DataFrame(columns=[
+            "locus_id", "locus_name", "locus_range", "chromosome", "start", "end",
+            "gene_symbol", "ensembl_gene_id",
+        ])
 
     out_path = output_dir / "evidence_matrix.tsv"
     df.to_csv(out_path, sep="\t", index=False)
@@ -216,21 +255,45 @@ def export_metadata(conn: Any, study_ids: list[str], output_dir: Path) -> Path:
             "WHERE is_integrated = TRUE"
         ).fetchall()
 
-    # Use first study for shared metadata, list traits
-    base = {k: v for k, v in studies[0].items() if v is not None}
-    base.pop("study_id", None)
-    base.pop("trait", None)
-    base["traits"] = [s["trait"] for s in studies]
-
-    metadata = {
-        "study": base,
-        "n_loci": n_loci,
-        "evidence_categories": categories,
-        "data_sources": [
-            {"source_tag": r[0], "source_name": r[1], "evidence_category": r[2]}
-            for r in ds_rows
-        ],
+    # Build PEGASUS-standard metadata structure
+    base = studies[0]
+    dataset = {
+        "study_name": base.get("study_name"),
+        "trait_description": base.get("trait_description"),
+        "trait_ontology_id": base.get("trait_ontology_id"),
+        "traits": [s["trait"] for s in studies],
+        "peg_source": base.get("doi"),
     }
+    dataset = {k: v for k, v in dataset.items() if v is not None}
+
+    gwas = {}
+    if base.get("gwas_source"):
+        gwas["gwas_source"] = base["gwas_source"]
+    if base.get("sample_size"):
+        gwas["sample_size"] = base["sample_size"]
+    if base.get("ancestry"):
+        gwas["ancestry"] = base["ancestry"]
+    if base.get("sex"):
+        gwas["sex"] = base["sex"]
+
+    genomic = {
+        "genome_build": base.get("genome_build", "hg38"),
+        "n_loci": n_loci,
+    }
+
+    source_metadata = [
+        {"source_tag": r[0], "source_name": r[1], "evidence_category": r[2]}
+        for r in ds_rows
+    ]
+
+    metadata: dict = {
+        "dataset": dataset,
+        "genomic": genomic,
+        "evidence_categories": categories,
+        "sources": source_metadata,
+    }
+    if gwas:
+        metadata["gwas"] = gwas
 
     out_path = output_dir / "metadata.yaml"
     out_path.write_text(yaml.dump(metadata, default_flow_style=False, sort_keys=False))

@@ -71,6 +71,16 @@ def apply_transformations(
                 df = _transform_select(df, t)
             elif t_type == "deduplicate":
                 df = _transform_deduplicate(df, t)
+            elif t_type == "strip_prefix":
+                df = _transform_strip_prefix(df, t)
+            elif t_type == "uppercase":
+                df = _transform_uppercase(df, t)
+            elif t_type == "drop_nulls":
+                df = _transform_drop_nulls(df, t)
+            elif t_type == "coerce_numeric":
+                df = _transform_coerce_numeric(df, t)
+            elif t_type == "filter_values":
+                df = _transform_filter_values(df, t)
             elif t_type == "custom":
                 df = _transform_custom(df, t)
             else:
@@ -128,6 +138,49 @@ def _transform_deduplicate(df: pd.DataFrame, t: dict) -> pd.DataFrame:
     column = t.get("column")
     if column and column in df.columns:
         return df.drop_duplicates(subset=[column], keep="first")
+    return df
+
+
+def _transform_strip_prefix(df: pd.DataFrame, t: dict) -> pd.DataFrame:
+    """Strip a prefix string from all values in a column."""
+    col = t.get("column")
+    prefix = t.get("prefix", "")
+    if col and col in df.columns and prefix:
+        df[col] = df[col].astype(str).str.removeprefix(prefix)
+    return df
+
+
+def _transform_uppercase(df: pd.DataFrame, t: dict) -> pd.DataFrame:
+    """Uppercase all values in a column."""
+    col = t.get("column")
+    if col and col in df.columns:
+        df[col] = df[col].astype(str).str.upper()
+    return df
+
+
+def _transform_drop_nulls(df: pd.DataFrame, t: dict) -> pd.DataFrame:
+    """Drop rows where a column is null, empty, or NaN."""
+    col = t.get("column")
+    if col and col in df.columns:
+        df = df.dropna(subset=[col])
+        df = df[df[col].astype(str).str.strip() != ""]
+    return df
+
+
+def _transform_coerce_numeric(df: pd.DataFrame, t: dict) -> pd.DataFrame:
+    """Convert column to numeric, setting non-numeric values to NaN."""
+    col = t.get("column")
+    if col and col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def _transform_filter_values(df: pd.DataFrame, t: dict) -> pd.DataFrame:
+    """Keep only rows where column values match a regex pattern."""
+    col = t.get("column")
+    pattern = t.get("pattern")
+    if col and col in df.columns and pattern:
+        df = df[df[col].astype(str).str.match(pattern, na=False)]
     return df
 
 

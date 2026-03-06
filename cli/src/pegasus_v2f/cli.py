@@ -561,8 +561,53 @@ def _columns_from_preview(preview_df, skip_rows=0):
     return columns
 
 
+def _apply_suggested_fixes(fixes):
+    """Prompt user to accept/skip suggested transformation fixes.
+
+    Returns list of accepted transformation dicts.
+    """
+    import questionary
+
+    actionable = [f for f in fixes if f.transformation is not None]
+    if not actionable:
+        return []
+
+    click.echo()
+    choice = questionary.select(
+        "Apply suggested transformations?",
+        choices=[
+            questionary.Choice("Accept all", value="a"),
+            questionary.Choice("Edit individually", value="e"),
+            questionary.Choice("Skip all", value="s"),
+        ],
+    ).ask()
+    if choice is None or choice == "s":
+        return []
+
+    if choice == "a":
+        return [f.transformation for f in actionable]
+
+    # Edit individually
+    accepted = []
+    for fix in actionable:
+        import json as _json
+        click.echo(f"\n  [{fix.code}] {fix.message}")
+        click.echo(f"  Transform: {_json.dumps(fix.transformation)}")
+        action = questionary.select(
+            "Action:",
+            choices=[
+                questionary.Choice("Accept", value="accept"),
+                questionary.Choice("Skip", value="skip"),
+            ],
+        ).ask()
+        if action == "accept":
+            accepted.append(fix.transformation)
+
+    return accepted
+
+
 def _build_evidence_blocks_interactive(source_name, preview_df, gene_column,
-                                       skip_rows, evidence_categories):
+                                       skip_rows, evidence_categories, ai_suggestion=None):
     """Interactive wizard to build one or more evidence blocks.
 
     Uses preview DataFrame to show columns, prompts for gene/chr/pos mapping,
@@ -652,17 +697,25 @@ def _build_evidence_blocks_interactive(source_name, preview_df, gene_column,
         click.echo("No evidence columns selected.")
         return None
 
-    # 5. Per-column config
+    # 5. Per-column config — show category descriptions from profiles
+    from pegasus_v2f.pegasus_schema import EVIDENCE_CATEGORY_PROFILES
     cats_sorted = sorted(evidence_categories.keys())
-    cat_choices = [f"{c} — {evidence_categories[c]}" for c in cats_sorted]
+    cat_choices = []
+    for c in cats_sorted:
+        profile = EVIDENCE_CATEGORY_PROFILES.get(c)
+        desc = f" ({profile.description[:50]})" if profile else ""
+        cat_choices.append(f"{c} — {evidence_categories[c]}{desc}")
 
-    # Try to guess category from source name
-    name_lower = source_name.lower()
+    # Try to guess category from source name (or AI suggestion)
     suggested_cat = None
-    for hint, cat in _NAME_CATEGORY_HINTS.items():
-        if hint in name_lower:
-            suggested_cat = cat
-            break
+    if ai_suggestion and ai_suggestion.category:
+        suggested_cat = ai_suggestion.category
+    else:
+        name_lower = source_name.lower()
+        for hint, cat in _NAME_CATEGORY_HINTS.items():
+            if hint in name_lower:
+                suggested_cat = cat
+                break
 
     ev_blocks = []
     for col in selected:
@@ -671,7 +724,7 @@ def _build_evidence_blocks_interactive(source_name, preview_df, gene_column,
         # Category
         cat_default = None
         if suggested_cat:
-            cat_default = f"{suggested_cat} — {evidence_categories[suggested_cat]}"
+            cat_default = next((ch for ch in cat_choices if ch.startswith(f"{suggested_cat} — ")), None)
         cat_answer = questionary.select(
             f"Evidence category for '{col}':",
             choices=cat_choices,
@@ -776,10 +829,11 @@ def _build_evidence_blocks_interactive(source_name, preview_df, gene_column,
 @click.option("--force", is_flag=True, help="Replace source if it already exists.")
 @click.option("--evidence-json", default=None,
     help="JSON list of evidence blocks (for multi-category non-interactive use).")
+@click.option("--ai", "use_ai", is_flag=True, help="Enable AI-assisted category suggestion.")
 @click.pass_context
 def source_add(ctx, name, source_type, url, file_path, sheet, skip_rows, gene_column,
                display_name, category, traits, source_tag, centric, no_score, force,
-               evidence_json):
+               evidence_json, use_ai):
     """Add a data source with evidence configuration.
 
     Shows a preview of the first rows so you can confirm which row is the
@@ -877,6 +931,30 @@ def source_add(ctx, name, source_type, url, file_path, sheet, skip_rows, gene_co
     if skip_rows:
         source_def["skip_rows"] = skip_rows
 
+    # --- Pre-wizard inspection + AI + fix suggestions ---
+    ai_suggestion = None
+    if category is None and evidence_json is None:
+        # Interactive mode — run inspection before wizard
+        from pegasus_v2f.loaders import load_source
+        from pegasus_v2f.inspect import inspect_dataframe, render_inspection
+
+        try:
+            inspect_df = load_source(source_def, data_dir=data_dir)
+            inspection = inspect_dataframe(inspect_df, source_name=name)
+            render_inspection(inspection)
+
+            # AI suggestion
+            if use_ai:
+                ai_suggestion = _show_ai_suggestion(inspection)
+
+            # Interactive fix application
+            if inspection.suggested_fixes:
+                accepted_transforms = _apply_suggested_fixes(inspection.suggested_fixes)
+                if accepted_transforms:
+                    source_def.setdefault("transformations", []).extend(accepted_transforms)
+        except Exception as e:
+            click.echo(f"  Inspection skipped: {e}", err=True)
+
     # --- Evidence configuration ---
     if category is not None:
         # Non-interactive single-category (--category flag)
@@ -909,7 +987,8 @@ def source_add(ctx, name, source_type, url, file_path, sheet, skip_rows, gene_co
     else:
         # Interactive wizard
         ev_blocks = _build_evidence_blocks_interactive(name, preview, gene_column,
-                                                       skip_rows or 0, EVIDENCE_CATEGORIES)
+                                                       skip_rows or 0, EVIDENCE_CATEGORIES,
+                                                       ai_suggestion=ai_suggestion)
         if ev_blocks:
             source_def["evidence"] = ev_blocks
 
@@ -943,6 +1022,114 @@ def source_add(ctx, name, source_type, url, file_path, sheet, skip_rows, gene_co
         render_report(report, json_mode=True)
     elif report.has_warnings:
         render_report(report)
+
+
+@source.command("inspect")
+@handle_errors
+@click.argument("name")
+@click.option("--type", "source_type", type=click.Choice(["googlesheets", "file", "excel", "url"]))
+@click.option("--url", default=None, help="Source URL.")
+@click.option("--path", "file_path", default=None, help="Local file path.")
+@click.option("--sheet", default=None, help="Sheet/tab name.")
+@click.option("--skip", "skip_rows", default=None, type=int, help="Rows to skip before header.")
+@click.option("--ai", "use_ai", is_flag=True, help="Enable AI-assisted category suggestion.")
+@click.option("--json", "json_output", is_flag=True, help="Output structured JSON.")
+@click.pass_context
+def source_inspect(ctx, name, source_type, url, file_path, sheet, skip_rows, use_ai, json_output):
+    """Inspect a data source for PEGASUS compatibility before loading.
+
+    Profiles columns, validates gene symbols, checks chromosome formats,
+    and suggests evidence category mappings. Use --ai for AI-assisted
+    category detection via claude CLI.
+    """
+    from pegasus_v2f.project import find_project_root
+    from pegasus_v2f.config import read_config
+    from pegasus_v2f.loaders import load_source
+    from pegasus_v2f.inspect import inspect_dataframe, render_inspection
+
+    source_def = {"name": name, "source_type": source_type or "file"}
+    if url:
+        source_def["url"] = url
+    if file_path:
+        source_def["path"] = file_path
+    if sheet:
+        source_def["sheet"] = sheet
+    if skip_rows:
+        source_def["skip_rows"] = skip_rows
+
+    root = find_project_root(ctx.obj.get("project"))
+    data_dir = None
+    if root:
+        data_dir = root / "data" / "raw"
+        if not data_dir.exists():
+            data_dir = root
+
+    try:
+        df = load_source(source_def, data_dir=data_dir)
+    except Exception as e:
+        raise click.ClickException(f"Could not load source: {e}")
+
+    result = inspect_dataframe(df, source_name=name)
+
+    if json_output or ctx.obj.get("json_output"):
+        import json as _json
+        output = result.to_dict()
+        # AI section added below if applicable
+        if use_ai:
+            from pegasus_v2f.ai_assist import get_provider
+            provider = get_provider("auto")
+            if provider:
+                suggestion = provider.suggest(result)
+                if suggestion:
+                    output["ai_suggestion"] = suggestion.to_dict()
+                else:
+                    click.echo("AI suggestion failed — showing inspection only.", err=True)
+            else:
+                click.echo("AI provider not available (claude CLI not found).", err=True)
+        print(_json.dumps(output, indent=2))
+        return
+
+    render_inspection(result)
+
+    if use_ai:
+        _show_ai_suggestion(result)
+
+
+def _show_ai_suggestion(result):
+    """Run AI provider and display suggestion. Gracefully degrades on failure."""
+    from pegasus_v2f.ai_assist import get_provider
+    from pegasus_v2f.pegasus_schema import EVIDENCE_CATEGORIES
+    from rich.console import Console
+    import sys
+
+    console = Console(stderr=True, file=sys.stderr)
+    provider = get_provider("auto")
+    if not provider:
+        console.print("  [yellow]AI provider not available (claude CLI not found)[/yellow]\n")
+        return None
+
+    console.print(f"\n  [dim]Running AI analysis ({provider.name})...[/dim]")
+    suggestion = provider.suggest(result)
+    if not suggestion:
+        console.print("  [yellow]AI suggestion failed — continuing without AI[/yellow]\n")
+        return None
+
+    console.print(f"\n  [bold]AI Analysis[/bold] ({provider.name})")
+    if suggestion.category:
+        label = EVIDENCE_CATEGORIES.get(suggestion.category, "")
+        console.print(f"    Category: [bold]{suggestion.category}[/bold] ({label})")
+    console.print(f"    \"{suggestion.category_reasoning}\"")
+    if suggestion.column_mappings:
+        mappings_str = ", ".join(f"{k}->{v}" for k, v in suggestion.column_mappings.items())
+        console.print(f"    Mappings: {mappings_str}")
+    console.print(f"    Centric: {suggestion.centric}")
+    if suggestion.quality_notes:
+        console.print(f"\n    Notes:")
+        for note in suggestion.quality_notes:
+            console.print(f"    - {note}")
+    console.print(f"    Confidence: {suggestion.confidence:.0%}\n")
+
+    return suggestion
 
 
 @source.command("show")

@@ -2,38 +2,215 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any
 
 from pegasus_v2f.db import is_postgres
 
 # -- PEGASUS controlled vocabulary --
-# 22 evidence category abbreviations from the PEGASUS standard.
-# Keys are the canonical abbreviations used in the database;
-# values are human-readable labels.
+# 22 evidence categories from the real PEGASUS standard.
+# https://ebispot.github.io/PEGASUS/docs/peg-evidence
 
+
+@dataclass
+class CategoryProfile:
+    """Rich profile for a PEGASUS evidence category."""
+
+    abbrev: str
+    label: str
+    description: str
+    centric_group: str  # "variant", "gene", "both"
+    column_hints: list[str] = field(default_factory=list)
+    source_name_hints: list[str] = field(default_factory=list)
+    typical_value: str = "score"  # "pvalue", "score", "presence", "effect_size"
+
+
+# All 22 real PEGASUS categories organized by centric group.
+EVIDENCE_CATEGORY_PROFILES: dict[str, CategoryProfile] = {
+    # --- Variant-centric (10) ---
+    "LD": CategoryProfile(
+        "LD", "Linkage Disequilibrium",
+        "Variant is correlated with another variant, may act as proxy",
+        "variant",
+        column_hints=["ld", "r2", "d_prime", "proxy"],
+        source_name_hints=["ld", "proxy"],
+        typical_value="score",
+    ),
+    "FM": CategoryProfile(
+        "FM", "Finemapping / Credible Sets",
+        "High posterior probability of causality through finemapping",
+        "variant",
+        column_hints=["pip", "credible", "finemap", "susie", "posterior"],
+        source_name_hints=["finemap", "credible", "susie"],
+        typical_value="score",
+    ),
+    "COLOC": CategoryProfile(
+        "COLOC", "Colocalization",
+        "Variant affects multiple traits at the same locus (shared causal variant)",
+        "variant",
+        column_hints=["pp.h4", "pph4", "posterior", "h4", "pip", "coloc"],
+        source_name_hints=["coloc"],
+        typical_value="score",
+    ),
+    "QTL": CategoryProfile(
+        "QTL", "Molecular QTL",
+        "eQTL, sQTL, pQTL — variant influences expression, splicing, or protein levels",
+        "variant",
+        column_hints=["eqtl", "sqtl", "pqtl", "grex", "qtl"],
+        source_name_hints=["eqtl", "sqtl", "pqtl", "qtl"],
+        typical_value="pvalue",
+    ),
+    "MR": CategoryProfile(
+        "MR", "Mendelian Randomization",
+        "Genetic variants as proxies for exposures to test causal effects",
+        "variant",
+        column_hints=["mr", "mendelian", "ivw", "wald_ratio"],
+        source_name_hints=["mr", "mendelian"],
+        typical_value="pvalue",
+    ),
+    "REG": CategoryProfile(
+        "REG", "Regulatory Region",
+        "Variant lies in open chromatin or enhancer/promoter in relevant tissue",
+        "variant",
+        column_hints=["atac", "dnase", "enhancer", "promoter", "open_chromatin", "epig"],
+        source_name_hints=["atac", "dnase", "regulatory", "epigenomic"],
+        typical_value="score",
+    ),
+    "3D": CategoryProfile(
+        "3D", "Chromatin Interaction",
+        "Variant physically contacts gene promoter via 3D chromatin structure",
+        "variant",
+        column_hints=["hic", "hi-c", "tad", "chromatin", "4c", "capture"],
+        source_name_hints=["chromatin", "hic", "3d"],
+        typical_value="score",
+    ),
+    "FUNC": CategoryProfile(
+        "FUNC", "Predicted Functional Impact",
+        "Computational prediction of disrupted gene/protein function or motifs",
+        "variant",
+        column_hints=["cadd", "sift", "polyphen", "coding", "missense", "lof"],
+        source_name_hints=["functional", "coding", "missense", "cadd"],
+        typical_value="score",
+    ),
+    "PROX": CategoryProfile(
+        "PROX", "Proximity to Gene",
+        "Variant location within or adjacent to gene boundaries",
+        "variant",
+        column_hints=["proximity", "nearest", "distance", "closest"],
+        source_name_hints=["proximity", "nearest"],
+        typical_value="score",
+    ),
+    "GWAS": CategoryProfile(
+        "GWAS", "GWAS Association",
+        "Statistical association p-value from GWAS",
+        "variant",
+        column_hints=["pvalue", "p_value", "min_p", "gwas"],
+        source_name_hints=["gwas", "sumstat"],
+        typical_value="pvalue",
+    ),
+    "PHEWAS": CategoryProfile(
+        "PHEWAS", "Phenome-Wide Association",
+        "Variant shows associations across multiple traits (pleiotropy)",
+        "variant",
+        column_hints=["phewas", "pleiotropy", "n_traits"],
+        source_name_hints=["phewas"],
+        typical_value="score",
+    ),
+    # --- Gene-centric (9) ---
+    "PPI": CategoryProfile(
+        "PPI", "Protein-Protein Interaction",
+        "Gene's protein engages with disease-relevant proteins",
+        "gene",
+        column_hints=["ppi", "string", "interactor", "protein_interaction"],
+        source_name_hints=["ppi", "string", "interactome"],
+        typical_value="score",
+    ),
+    "SET": CategoryProfile(
+        "SET", "Pathway or Gene Sets",
+        "Gene in phenotype-relevant pathways or complexes",
+        "gene",
+        column_hints=["pathway", "kegg", "go", "reactome", "gene_set"],
+        source_name_hints=["pathway", "network", "gene_set"],
+        typical_value="presence",
+    ),
+    "GENEBASE": CategoryProfile(
+        "GENEBASE", "Gene-based Association",
+        "Aggregate variant-level association within gene",
+        "gene",
+        column_hints=["magma", "vegas", "skat", "gene_based", "gene_p"],
+        source_name_hints=["magma", "gene_based"],
+        typical_value="pvalue",
+    ),
+    "EXP": CategoryProfile(
+        "EXP", "Expression",
+        "Differential expression in relevant tissues or patient populations",
+        "gene",
+        column_hints=["log2fc", "fold_change", "p_val_adj", "expression", "rpkm", "tpm"],
+        source_name_hints=["deg", "expression", "single_cell"],
+        typical_value="pvalue",
+    ),
+    "PERTURB": CategoryProfile(
+        "PERTURB", "Perturbation",
+        "Knockouts, CRISPR, organoids show phenotype effects",
+        "gene",
+        column_hints=["crispr", "knockout", "perturbation", "screen", "organoid"],
+        source_name_hints=["crispr", "perturbation", "screen", "knockout"],
+        typical_value="score",
+    ),
+    "KNOW": CategoryProfile(
+        "KNOW", "Biological Knowledge",
+        "Inferred relationships based on known biology",
+        "gene",
+        column_hints=["secreted", "localization", "function", "biology"],
+        source_name_hints=["secretome", "hpa", "uniprot"],
+        typical_value="presence",
+    ),
+    "TPWAS": CategoryProfile(
+        "TPWAS", "Genetically Predicted Trait",
+        "TWAS or PWAS — expression/protein levels associated with phenotype",
+        "gene",
+        column_hints=["twas", "pwas", "tpwas", "genetically_predicted"],
+        source_name_hints=["twas", "pwas", "tpwas"],
+        typical_value="pvalue",
+    ),
+    "DRUG": CategoryProfile(
+        "DRUG", "Drug Related",
+        "Gene targeted by therapeutics for the phenotype",
+        "gene",
+        column_hints=["drug", "therapeutic", "target", "drugbank"],
+        source_name_hints=["drug", "therapeutic", "drugbank"],
+        typical_value="presence",
+    ),
+    # --- Variant or Gene-centric (3) ---
+    "CROSSP": CategoryProfile(
+        "CROSSP", "Cross-phenotype",
+        "Evidence from biologically related phenotypes",
+        "both",
+        column_hints=["cross_phenotype", "related_trait", "crossp"],
+        source_name_hints=["cross_phenotype", "related"],
+        typical_value="score",
+    ),
+    "LIT": CategoryProfile(
+        "LIT", "Literature Curation",
+        "Human-curated gene or variant-disease links from literature",
+        "both",
+        column_hints=["literature", "curated", "pubmed", "citation"],
+        source_name_hints=["literature", "curated"],
+        typical_value="presence",
+    ),
+    "DB": CategoryProfile(
+        "DB", "Curated Database",
+        "Evidence from ClinVar, ClinGen, OMIM, etc.",
+        "both",
+        column_hints=["clinvar", "omim", "clingen", "orphanet"],
+        source_name_hints=["clinvar", "omim", "clingen"],
+        typical_value="presence",
+    ),
+}
+
+# Derived abbreviation → label dict (used by validation, wizard, etc.)
 EVIDENCE_CATEGORIES: dict[str, str] = {
-    "QTL": "Quantitative Trait Locus",
-    "COLOC": "Colocalization",
-    "GWAS": "GWAS Association",
-    "PROX": "Proximity",
-    "CODE": "Coding Variant",
-    "RARE": "Rare Variant",
-    "EXP": "Expression",
-    "EPIG": "Epigenomic",
-    "CHROM": "Chromatin Interaction",
-    "REG": "Regulatory",
-    "FUNC": "Functional",
-    "MOD": "Animal Model",
-    "DRUG": "Druggability",
-    "PATH": "Pathway",
-    "PPI": "Protein-Protein Interaction",
-    "KNOW": "Known Biology",
-    "LIT": "Literature",
-    "CLIN": "Clinical",
-    "OMICS": "Multi-omics",
-    "PERT": "Perturbation",
-    "EVOL": "Evolutionary",
-    "OTHER": "Other",
+    p.abbrev: p.label for p in EVIDENCE_CATEGORY_PROFILES.values()
 }
 
 
