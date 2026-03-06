@@ -9,7 +9,7 @@ from typing import Any
 
 import yaml
 
-from pegasus_v2f.db import is_postgres
+from pegasus_v2f.db import is_postgres, raw_table_name
 from pegasus_v2f.pegasus_schema import EVIDENCE_CATEGORIES
 
 logger = logging.getLogger(__name__)
@@ -50,16 +50,17 @@ def detect_columns(conn: Any, table_name: str) -> list[dict]:
 
     Returns list of dicts with keys: name, type, sample_values.
     """
+    raw_name = raw_table_name(table_name)
     if is_postgres(conn):
         cur = conn.cursor()
         cur.execute(
-            f'SELECT * FROM "{table_name}" LIMIT 5'
+            f'SELECT * FROM "{raw_name}" LIMIT 5'
         )
         cols = [desc[0] for desc in cur.description]
         rows = cur.fetchall()
         cur.close()
     else:
-        result = conn.execute(f'SELECT * FROM "{table_name}" LIMIT 5')
+        result = conn.execute(f'SELECT * FROM "{raw_name}" LIMIT 5')
         cols = [desc[0] for desc in result.description]
         rows = result.fetchall()
 
@@ -156,7 +157,8 @@ def validate_mapping(mapping: dict) -> list[str]:
             errors.append("source_tag is required")
 
         fields = mapping.get("fields", {})
-        if not fields.get("gene"):
+        # gene is optional for locus_definition (loci can be position-only)
+        if role == "gwas_sumstats" and not fields.get("gene"):
             errors.append("Field mapping for 'gene' is required")
         if not fields.get("chromosome"):
             errors.append("Locus source requires 'chromosome' field")
@@ -199,54 +201,34 @@ def validate_mapping(mapping: dict) -> list[str]:
 def apply_integration(
     conn: Any,
     source_name: str,
-    mapping: dict,
+    mappings: list[dict],
     config: dict,
     config_path: Path | None = None,
 ) -> dict:
-    """Apply an evidence mapping to a raw table.
+    """Apply one or more evidence mappings to a raw table.
 
-    1. Builds the evidence block from the mapping
-    2. Writes it to v2f.yaml (in place) if config_path provided
-    3. Loads the raw table through evidence routing
-    4. Drops the raw table
-    5. Re-runs scoring if loci exist
+    1. Builds evidence blocks from the mappings
+    2. Writes them to v2f.yaml (in place) if config_path provided
+    3. Loads the raw table through evidence routing (once per block)
+    4. Re-runs scoring once at the end
 
     Args:
         conn: Open database connection.
         source_name: Name of the raw table/source.
-        mapping: dict with category, centric, source_tag, fields, evidence_type (optional).
+        mappings: List of mapping dicts (category, centric, source_tag, fields, etc.).
         config: Full resolved config dict.
         config_path: Path to v2f.yaml (for in-place modification). None = skip file update.
 
     Returns:
         Summary dict with results.
     """
-    from pegasus_v2f.evidence import route_evidence_source
-    from pegasus_v2f.loaders import load_source
-    from pegasus_v2f.transform import apply_transformations, clean_for_db
+    from pegasus_v2f.evidence_loader import load_evidence
+    from pegasus_v2f.sources import _delete_evidence_by_source_tag, update_source_in_meta
 
-    # Build evidence block
-    if mapping.get("role"):
-        evidence_block = {
-            "role": mapping["role"],
-            "source_tag": mapping["source_tag"],
-            "fields": mapping["fields"],
-        }
-    else:
-        evidence_block = {
-            "category": mapping["category"],
-            "centric": mapping["centric"],
-            "source_tag": mapping["source_tag"],
-            "fields": mapping["fields"],
-        }
-        if mapping.get("evidence_type"):
-            evidence_block["evidence_type"] = mapping["evidence_type"]
-
-    # Add study and trait if present
-    if mapping.get("study"):
-        evidence_block["study"] = mapping["study"]
-    if mapping.get("trait"):
-        evidence_block["trait"] = mapping["trait"]
+    # Build evidence blocks from mappings
+    evidence_blocks = []
+    for mapping in mappings:
+        evidence_blocks.append(_build_evidence_block(mapping))
 
     # Find the source in config
     sources = config.get("data_sources", [])
@@ -254,73 +236,91 @@ def apply_integration(
     if not source:
         raise ValueError(f"Source '{source_name}' not found in config")
 
-    # Add evidence block to source
-    source_with_evidence = {**source, "evidence": evidence_block}
-
     # Update v2f.yaml in place
     if config_path and config_path.exists():
-        _update_yaml_evidence_block(config_path, source_name, evidence_block)
+        _update_yaml_evidence_block(config_path, source_name, evidence_blocks)
 
-    # Load raw data from the existing table (it's already in the DB)
+    # Load raw data from the raw table (it's already in the DB)
+    raw_name = raw_table_name(source_name)
     if is_postgres(conn):
         cur = conn.cursor()
-        cur.execute(f'SELECT * FROM "{source_name}"')
+        cur.execute(f'SELECT * FROM "{raw_name}"')
         cols = [desc[0] for desc in cur.description]
         rows = cur.fetchall()
         cur.close()
     else:
-        result = conn.execute(f'SELECT * FROM "{source_name}"')
+        result = conn.execute(f'SELECT * FROM "{raw_name}"')
         cols = [desc[0] for desc in result.description]
         rows = result.fetchall()
 
     import pandas as pd
     df = pd.DataFrame(rows, columns=cols)
 
-    # Ensure PEGASUS schema exists (tables may not exist if DB was built
-    # with only raw sources and no `v2f build`)
+    # Ensure PEGASUS schema exists
     from pegasus_v2f.pegasus_schema import create_pegasus_schema
     create_pegasus_schema(conn)
 
-    # Route through evidence loader
-    load_result = route_evidence_source(conn, source_with_evidence, df, config)
+    # Process each evidence block
+    load_results = []
+    for block in evidence_blocks:
+        # Delete existing evidence rows for this source_tag (allows re-integration)
+        source_tag = block.get("source_tag", "")
+        if source_tag:
+            _delete_evidence_by_source_tag(conn, source_tag)
 
-    # Sync evidence block to _pegasus_meta so remove-source can find it
-    from pegasus_v2f.sources import update_source_in_meta
-    update_source_in_meta(conn, source_name, {"evidence": evidence_block})
+        # Load through unified evidence loader
+        load_result = load_evidence(conn, source, df, block)
+        load_results.append(load_result)
 
-    # Drop the raw table
-    conn.execute(f'DROP TABLE IF EXISTS "{source_name}"')
-
-    # Re-run scoring if loci exist
-    n_scored = 0
-    if config.get("pegasus"):
-        loci_exist = conn.execute("SELECT COUNT(*) FROM loci").fetchone()[0] > 0
-        if loci_exist:
-            from pegasus_v2f.scoring import compute_locus_gene_scores
-            n_scored = compute_locus_gene_scores(conn, config)
+    # Sync evidence blocks to _pegasus_meta (as a list)
+    update_source_in_meta(conn, source_name, {"evidence": evidence_blocks})
 
     summary = {
         "source": source_name,
-        "evidence_block": evidence_block,
-        "load_result": load_result,
-        "raw_table_dropped": True,
-        "scores_computed": n_scored,
+        "evidence_blocks": evidence_blocks,
+        "load_results": load_results,
     }
-    if mapping.get("role"):
-        logger.info(f"Integrated '{source_name}' as {mapping['role']}")
-    else:
-        logger.info(f"Integrated '{source_name}' as {mapping['category']} ({mapping['centric']})")
+    n = len(evidence_blocks)
+    logger.info(f"Integrated '{source_name}' as {n} evidence {'entry' if n == 1 else 'entries'}")
     return summary
+
+
+def _build_evidence_block(mapping: dict) -> dict:
+    """Build an evidence block dict from a mapping dict."""
+    if mapping.get("role"):
+        block = {
+            "role": mapping["role"],
+            "source_tag": mapping["source_tag"],
+            "fields": mapping["fields"],
+        }
+    else:
+        block = {
+            "category": mapping["category"],
+            "source_tag": mapping["source_tag"],
+            "fields": mapping["fields"],
+        }
+        if mapping.get("centric"):
+            block["centric"] = mapping["centric"]
+        if mapping.get("evidence_type"):
+            block["evidence_type"] = mapping["evidence_type"]
+
+    if mapping.get("study"):
+        block["study"] = mapping["study"]
+    if mapping.get("trait"):
+        block["trait"] = mapping["trait"]
+
+    return block
 
 
 def _update_yaml_evidence_block(
     config_path: Path,
     source_name: str,
-    evidence_block: dict,
+    evidence_blocks: list[dict],
 ) -> None:
-    """Insert an evidence block into v2f.yaml for the named source, in place.
+    """Insert evidence blocks (list format) into v2f.yaml for the named source.
 
     Uses string manipulation to preserve comments and formatting.
+    Always writes ``evidence:`` as a YAML list, even for a single block.
     """
     text = config_path.read_text()
     lines = text.split("\n")
@@ -359,10 +359,9 @@ def _update_yaml_evidence_block(
         # End of this source block: any line at base indent or less
         if line_indent <= base_indent:
             break
-        # Check if evidence block already exists
+        # Check if evidence block already exists — remove it
         if stripped.startswith("evidence:"):
             logger.info(f"Source '{source_name}' already has evidence block — replacing")
-            # Remove existing evidence block
             end_ev = insert_idx + 1
             while end_ev < len(lines):
                 ev_line = lines[end_ev]
@@ -383,32 +382,58 @@ def _update_yaml_evidence_block(
     # Insert right after the last property line (not after trailing blank lines)
     insert_idx = last_prop_idx + 1
 
-    # Build evidence YAML lines
+    # Build evidence YAML lines — always list format
     indent = " " * prop_indent
-    sub_indent = " " * (prop_indent + 2)
-    field_indent = " " * (prop_indent + 4)
+    item_indent = " " * (prop_indent + 2)       # "- " prefix for list items
+    sub_indent = " " * (prop_indent + 4)         # continuation after "- "
+    field_indent = " " * (prop_indent + 6)       # fields: values
 
     ev_lines = [f"{indent}evidence:"]
-    if evidence_block.get("role"):
-        ev_lines.append(f"{sub_indent}role: {evidence_block['role']}")
-    else:
-        ev_lines.append(f"{sub_indent}category: {evidence_block['category']}")
-        ev_lines.append(f"{sub_indent}centric: {evidence_block['centric']}")
-    if evidence_block.get("study"):
-        ev_lines.append(f"{sub_indent}study: {evidence_block['study']}")
-    if evidence_block.get("trait"):
-        ev_lines.append(f"{sub_indent}trait: {evidence_block['trait']}")
-    ev_lines.append(f"{sub_indent}source_tag: {evidence_block['source_tag']}")
-    if evidence_block.get("evidence_type"):
-        ev_lines.append(f"{sub_indent}evidence_type: {evidence_block['evidence_type']}")
-    if evidence_block.get("fields"):
-        ev_lines.append(f"{sub_indent}fields:")
-        for k, v in evidence_block["fields"].items():
-            ev_lines.append(f"{field_indent}{k}: {v}")
+    for block in evidence_blocks:
+        # First key of each block gets the "- " prefix
+        first = True
+        for key, value in _evidence_block_items(block):
+            if key == "fields":
+                if first:
+                    ev_lines.append(f"{item_indent}- fields:")
+                    first = False
+                else:
+                    ev_lines.append(f"{sub_indent}fields:")
+                for fk, fv in value.items():
+                    ev_lines.append(f"{field_indent}{fk}: {fv}")
+            else:
+                if first:
+                    ev_lines.append(f"{item_indent}- {key}: {value}")
+                    first = False
+                else:
+                    ev_lines.append(f"{sub_indent}{key}: {value}")
 
     # Insert before the next source block
     for ev_line in reversed(ev_lines):
         lines.insert(insert_idx, ev_line)
 
     config_path.write_text("\n".join(lines))
-    logger.info(f"Updated {config_path} with evidence block for '{source_name}'")
+    n = len(evidence_blocks)
+    logger.info(
+        f"Updated {config_path} with {n} evidence "
+        f"{'entry' if n == 1 else 'entries'} for '{source_name}'"
+    )
+
+
+def _evidence_block_items(block: dict):
+    """Yield (key, value) pairs for an evidence block in canonical order."""
+    # Role-based or category-based first
+    if block.get("role"):
+        yield "role", block["role"]
+    else:
+        yield "category", block["category"]
+        yield "centric", block["centric"]
+    if block.get("study"):
+        yield "study", block["study"]
+    if block.get("trait"):
+        yield "trait", block["trait"]
+    yield "source_tag", block["source_tag"]
+    if block.get("evidence_type"):
+        yield "evidence_type", block["evidence_type"]
+    if block.get("fields"):
+        yield "fields", block["fields"]

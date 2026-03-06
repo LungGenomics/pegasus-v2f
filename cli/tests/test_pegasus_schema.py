@@ -40,9 +40,8 @@ class TestCreatePegasusSchema:
             "variants",
             "studies",
             "loci",
-            "locus_gene_evidence",
-            "gene_evidence",
-            "locus_gene_scores",
+            "evidence",
+            "scored_evidence",
             "data_sources",
         }
         assert expected == tables
@@ -51,7 +50,7 @@ class TestCreatePegasusSchema:
         create_pegasus_schema(conn)
         create_pegasus_schema(conn)  # should not raise
         tables = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
-        assert len(tables) == 8
+        assert len(tables) == 7
 
     def test_genes_table_columns(self, conn):
         create_pegasus_schema(conn)
@@ -75,49 +74,88 @@ class TestCreatePegasusSchema:
         }
         assert "locus_source" in cols
 
-    def test_locus_gene_evidence_identity(self, conn):
-        """Auto-increment ID works for locus_gene_evidence."""
+    def test_studies_has_study_name_and_sex(self, conn):
         create_pegasus_schema(conn)
-        # Need a study and locus first (foreign keys)
+        cols = {
+            r[0]
+            for r in conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'studies'"
+            ).fetchall()
+        }
+        assert "study_name" in cols
+        assert "sex" in cols
+
+    def test_evidence_identity(self, conn):
+        """Auto-increment ID works for evidence."""
+        create_pegasus_schema(conn)
         conn.execute(
-            "INSERT INTO studies (study_id, trait) VALUES ('test_study', 'HEIGHT')"
+            "INSERT INTO evidence (gene_symbol, evidence_category, source_tag) "
+            "VALUES ('GENE_A', 'GWAS', 'test_src')"
         )
         conn.execute(
-            "INSERT INTO loci (locus_id, study_id, chromosome, start_position, end_position) "
-            "VALUES ('locus_1', 'test_study', '1', 1000000, 2000000)"
-        )
-        conn.execute(
-            "INSERT INTO locus_gene_evidence (locus_id, gene_symbol, evidence_category, source_tag) "
-            "VALUES ('locus_1', 'GENE_A', 'GWAS', 'test_src')"
-        )
-        conn.execute(
-            "INSERT INTO locus_gene_evidence (locus_id, gene_symbol, evidence_category, source_tag) "
-            "VALUES ('locus_1', 'GENE_B', 'GWAS', 'test_src')"
+            "INSERT INTO evidence (gene_symbol, evidence_category, source_tag) "
+            "VALUES ('GENE_B', 'GWAS', 'test_src')"
         )
         rows = conn.execute(
-            "SELECT id FROM locus_gene_evidence ORDER BY id"
+            "SELECT evidence_id FROM evidence ORDER BY evidence_id"
         ).fetchall()
         assert len(rows) == 2
-        assert rows[0][0] != rows[1][0]  # different IDs
+        assert rows[0][0] != rows[1][0]
 
-    def test_unique_constraint_locus_gene_evidence(self, conn):
+    def test_evidence_gene_level(self, conn):
+        """Gene-level evidence has null chromosome/position."""
         create_pegasus_schema(conn)
         conn.execute(
-            "INSERT INTO studies (study_id, trait) VALUES ('s1', 'FEV1')"
+            "INSERT INTO evidence (gene_symbol, evidence_category, source_tag) "
+            "VALUES ('TP53', 'KNOW', 'hpa')"
+        )
+        row = conn.execute(
+            "SELECT chromosome, position FROM evidence WHERE gene_symbol = 'TP53'"
+        ).fetchone()
+        assert row[0] is None
+        assert row[1] is None
+
+    def test_evidence_variant_level(self, conn):
+        """Variant-level evidence has chromosome/position."""
+        create_pegasus_schema(conn)
+        conn.execute(
+            "INSERT INTO evidence (gene_symbol, chromosome, position, evidence_category, source_tag) "
+            "VALUES ('AGER', '6', 32180000, 'QTL', 'eqtl_src')"
+        )
+        row = conn.execute(
+            "SELECT chromosome, position FROM evidence WHERE gene_symbol = 'AGER'"
+        ).fetchone()
+        assert row[0] == "6"
+        assert row[1] == 32180000
+
+    def test_scored_evidence_insert(self, conn):
+        """scored_evidence rows can be inserted."""
+        create_pegasus_schema(conn)
+        conn.execute(
+            "INSERT INTO studies (study_id, study_name, trait) "
+            "VALUES ('shrine_FEV1', 'shrine', 'FEV1')"
         )
         conn.execute(
             "INSERT INTO loci (locus_id, study_id, chromosome, start_position, end_position) "
-            "VALUES ('l1', 's1', '1', 100, 200)"
+            "VALUES ('l1', 'shrine_FEV1', '6', 31000000, 33000000)"
         )
         conn.execute(
-            "INSERT INTO locus_gene_evidence (locus_id, gene_symbol, evidence_category, source_tag) "
-            "VALUES ('l1', 'G1', 'QTL', 'src1')"
+            "INSERT INTO scored_evidence (locus_id, study_id, gene_symbol, evidence_category, "
+            "source_tag, match_type) "
+            "VALUES ('l1', 'shrine_FEV1', 'AGER', 'QTL', 'eqtl_src', 'position')"
         )
-        with pytest.raises(duckdb.ConstraintException):
-            conn.execute(
-                "INSERT INTO locus_gene_evidence (locus_id, gene_symbol, evidence_category, source_tag) "
-                "VALUES ('l1', 'G1', 'QTL', 'src1')"
-            )
+        row = conn.execute(
+            "SELECT locus_id, gene_symbol, match_type FROM scored_evidence"
+        ).fetchone()
+        assert row == ("l1", "AGER", "position")
+
+    def test_old_tables_do_not_exist(self, conn):
+        """Old tables (gene_evidence, locus_gene_evidence, locus_gene_scores) are gone."""
+        create_pegasus_schema(conn)
+        tables = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
+        assert "gene_evidence" not in tables
+        assert "locus_gene_evidence" not in tables
+        assert "locus_gene_scores" not in tables
 
     def test_data_sources_table(self, conn):
         create_pegasus_schema(conn)
@@ -135,7 +173,8 @@ class TestCreatePegasusSchema:
     def test_loci_default_locus_source(self, conn):
         create_pegasus_schema(conn)
         conn.execute(
-            "INSERT INTO studies (study_id, trait) VALUES ('s1', 'FEV1')"
+            "INSERT INTO studies (study_id, study_name, trait) "
+            "VALUES ('s1', 'test', 'FEV1')"
         )
         conn.execute(
             "INSERT INTO loci (locus_id, study_id, chromosome, start_position, end_position) "
@@ -154,7 +193,8 @@ class TestCreateSchemaWithPegasus:
         tables = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
         assert "genes" in tables
         assert "loci" in tables
-        assert "locus_gene_evidence" in tables
+        assert "evidence" in tables
+        assert "scored_evidence" in tables
 
     def test_no_pegasus_tables_without_config(self, conn):
         from pegasus_v2f.db_schema import create_schema

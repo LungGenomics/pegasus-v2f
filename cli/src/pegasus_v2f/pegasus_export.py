@@ -14,36 +14,67 @@ from pegasus_v2f.db import is_postgres
 logger = logging.getLogger(__name__)
 
 
-def export_evidence_matrix(conn: Any, study_id: str, output_dir: Path) -> Path:
-    """Export PEGASUS evidence matrix as TSV.
+def _resolve_study_ids(conn: Any, study_name: str) -> list[str]:
+    """Resolve a study_name to its study_ids. Also accepts a direct study_id."""
+    if is_postgres(conn):
+        cur = conn.cursor()
+        cur.execute("SELECT study_id FROM studies WHERE study_name = %s", (study_name,))
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = conn.execute(
+            "SELECT study_id FROM studies WHERE study_name = ?", [study_name]
+        ).fetchall()
 
-    Pivots locus_gene_evidence + gene_evidence into a wide-format matrix
-    where rows are locus-gene pairs and columns are evidence types.
+    if rows:
+        return [r[0] for r in rows]
 
-    Returns path to written file.
-    """
+    # Fall back: maybe they passed a direct study_id
+    if is_postgres(conn):
+        cur = conn.cursor()
+        cur.execute("SELECT study_id FROM studies WHERE study_id = %s", (study_name,))
+        rows = cur.fetchall()
+        cur.close()
+    else:
+        rows = conn.execute(
+            "SELECT study_id FROM studies WHERE study_id = ?", [study_name]
+        ).fetchall()
+
+    return [r[0] for r in rows]
+
+
+def _in_clause(ids: list[str], pg: bool) -> tuple[str, list | tuple]:
+    """Build an IN clause and params for a list of IDs."""
+    if pg:
+        return ",".join(["%s"] * len(ids)), tuple(ids)
+    return ",".join(["?"] * len(ids)), ids
+
+
+def export_evidence_matrix(conn: Any, study_ids: list[str], output_dir: Path) -> Path:
+    """Export PEGASUS evidence matrix as TSV."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Get all loci for this study
+    ph, params = _in_clause(study_ids, is_postgres(conn))
+
     if is_postgres(conn):
         cur = conn.cursor()
         cur.execute(
-            "SELECT locus_id, locus_name, chromosome, start_position, end_position "
-            "FROM loci WHERE study_id = %s ORDER BY chromosome, start_position",
-            (study_id,),
+            f"SELECT locus_id, locus_name, chromosome, start_position, end_position "
+            f"FROM loci WHERE study_id IN ({ph}) ORDER BY chromosome, start_position",
+            params,
         )
         loci = cur.fetchall()
         cur.close()
     else:
         loci = conn.execute(
-            "SELECT locus_id, locus_name, chromosome, start_position, end_position "
-            "FROM loci WHERE study_id = ? ORDER BY chromosome, start_position",
-            [study_id],
+            f"SELECT locus_id, locus_name, chromosome, start_position, end_position "
+            f"FROM loci WHERE study_id IN ({ph}) ORDER BY chromosome, start_position",
+            params,
         ).fetchall()
 
     if not loci:
-        logger.warning(f"No loci found for study {study_id}")
+        logger.warning(f"No loci found for study_ids {study_ids}")
         out_path = output_dir / "evidence_matrix.tsv"
         pd.DataFrame(columns=["locus_id", "locus_name", "chromosome", "start", "end", "gene_symbol"]).to_csv(
             out_path, sep="\t", index=False
@@ -51,55 +82,42 @@ def export_evidence_matrix(conn: Any, study_id: str, output_dir: Path) -> Path:
         return out_path
 
     locus_ids = [l[0] for l in loci]
+    lph, lparams = _in_clause(locus_ids, is_postgres(conn))
 
-    # Build locus-gene evidence rows
-    placeholders = ",".join(["?" for _ in locus_ids])
     if is_postgres(conn):
-        placeholders = ",".join(["%s" for _ in locus_ids])
         cur = conn.cursor()
         cur.execute(
-            f"SELECT locus_id, gene_symbol, evidence_category, evidence_stream, "
+            f"SELECT locus_id, gene_symbol, evidence_category, source_tag, "
             f"pvalue, score, tissue "
-            f"FROM locus_gene_evidence WHERE locus_id IN ({placeholders})",
-            tuple(locus_ids),
+            f"FROM scored_evidence WHERE locus_id IN ({lph})",
+            lparams,
         )
-        lge_rows = cur.fetchall()
+        se_rows = cur.fetchall()
         cur.close()
     else:
-        lge_rows = conn.execute(
-            f"SELECT locus_id, gene_symbol, evidence_category, evidence_stream, "
+        se_rows = conn.execute(
+            f"SELECT locus_id, gene_symbol, evidence_category, source_tag, "
             f"pvalue, score, tissue "
-            f"FROM locus_gene_evidence WHERE locus_id IN ({placeholders})",
-            locus_ids,
+            f"FROM scored_evidence WHERE locus_id IN ({lph})",
+            lparams,
         ).fetchall()
 
-    # Collect unique evidence column names
-    evidence_cols = set()
-    for row in lge_rows:
-        category = row[2]
-        stream = row[3] or ""
-        col_name = f"{category}_{stream}" if stream else category
-        evidence_cols.add(col_name)
-
-    evidence_cols = sorted(evidence_cols)
-
-    # Build matrix
-    matrix_rows = []
+    evidence_cols = sorted({row[2] for row in se_rows if row[2]})
     locus_lookup = {l[0]: l for l in loci}
 
-    # Group evidence by (locus_id, gene_symbol)
     evidence_map: dict[tuple[str, str], dict] = {}
-    for row in lge_rows:
-        locus_id, gene, category, stream = row[0], row[1], row[2], row[3] or ""
-        pvalue, score, tissue = row[4], row[5], row[6]
+    for row in se_rows:
+        locus_id, gene, category = row[0], row[1], row[2]
+        pvalue, score = row[4], row[5]
+        if not category:
+            continue
         key = (locus_id, gene)
         if key not in evidence_map:
             evidence_map[key] = {}
-        col_name = f"{category}_{stream}" if stream else category
-        # Use score if available, else pvalue, else 1 (present)
         value = score if score is not None else (pvalue if pvalue is not None else 1)
-        evidence_map[key][col_name] = value
+        evidence_map[key][category] = value
 
+    matrix_rows = []
     for (locus_id, gene), ev_dict in evidence_map.items():
         locus = locus_lookup.get(locus_id)
         if not locus:
@@ -126,65 +144,60 @@ def export_evidence_matrix(conn: Any, study_id: str, output_dir: Path) -> Path:
     return out_path
 
 
-def export_metadata(conn: Any, study_id: str, output_dir: Path) -> Path:
-    """Export PEGASUS metadata YAML.
-
-    Contains study info, loci summary, evidence categories used, and data sources.
-
-    Returns path to written file.
-    """
+def export_metadata(conn: Any, study_ids: list[str], output_dir: Path) -> Path:
+    """Export PEGASUS metadata YAML."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Study info
+    ph, params = _in_clause(study_ids, is_postgres(conn))
+
+    # Study info (all trait rows)
     if is_postgres(conn):
         cur = conn.cursor()
-        cur.execute("SELECT * FROM studies WHERE study_id = %s", (study_id,))
+        cur.execute(f"SELECT * FROM studies WHERE study_id IN ({ph})", params)
         cols = [desc[0] for desc in cur.description]
-        study_row = cur.fetchone()
+        study_rows = cur.fetchall()
         cur.close()
     else:
-        result = conn.execute(
-            "SELECT * FROM studies WHERE study_id = ?", [study_id]
-        )
+        result = conn.execute(f"SELECT * FROM studies WHERE study_id IN ({ph})", params)
         cols = [desc[0] for desc in result.description]
-        study_row = result.fetchone()
+        study_rows = result.fetchall()
 
-    if not study_row:
-        logger.warning(f"Study {study_id} not found")
+    if not study_rows:
+        logger.warning(f"No studies found for {study_ids}")
         out_path = output_dir / "metadata.yaml"
         out_path.write_text("")
         return out_path
 
-    study_dict = dict(zip(cols, study_row))
+    studies = [dict(zip(cols, row)) for row in study_rows]
 
     # Loci count
     if is_postgres(conn):
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM loci WHERE study_id = %s", (study_id,))
+        cur.execute(f"SELECT COUNT(*) FROM loci WHERE study_id IN ({ph})", params)
         n_loci = cur.fetchone()[0]
         cur.close()
     else:
         n_loci = conn.execute(
-            "SELECT COUNT(*) FROM loci WHERE study_id = ?", [study_id]
+            f"SELECT COUNT(*) FROM loci WHERE study_id IN ({ph})", params
         ).fetchone()[0]
 
     # Evidence categories used
     if is_postgres(conn):
         cur = conn.cursor()
         cur.execute(
-            "SELECT DISTINCT evidence_category FROM locus_gene_evidence lge "
-            "JOIN loci l ON lge.locus_id = l.locus_id WHERE l.study_id = %s",
-            (study_id,),
+            f"SELECT DISTINCT evidence_category FROM scored_evidence "
+            f"WHERE study_id IN ({ph}) AND evidence_category IS NOT NULL",
+            params,
         )
         categories = sorted(r[0] for r in cur.fetchall())
         cur.close()
     else:
         categories = sorted(
             r[0] for r in conn.execute(
-                "SELECT DISTINCT evidence_category FROM locus_gene_evidence lge "
-                "JOIN loci l ON lge.locus_id = l.locus_id WHERE l.study_id = ?",
-                [study_id],
+                f"SELECT DISTINCT evidence_category FROM scored_evidence "
+                f"WHERE study_id IN ({ph}) AND evidence_category IS NOT NULL",
+                params,
             ).fetchall()
         )
 
@@ -203,8 +216,14 @@ def export_metadata(conn: Any, study_id: str, output_dir: Path) -> Path:
             "WHERE is_integrated = TRUE"
         ).fetchall()
 
+    # Use first study for shared metadata, list traits
+    base = {k: v for k, v in studies[0].items() if v is not None}
+    base.pop("study_id", None)
+    base.pop("trait", None)
+    base["traits"] = [s["trait"] for s in studies]
+
     metadata = {
-        "study": {k: v for k, v in study_dict.items() if v is not None},
+        "study": base,
         "n_loci": n_loci,
         "evidence_categories": categories,
         "data_sources": [
@@ -219,55 +238,62 @@ def export_metadata(conn: Any, study_id: str, output_dir: Path) -> Path:
     return out_path
 
 
-def export_peg_list(conn: Any, study_id: str, output_dir: Path) -> Path:
-    """Export PEG list — rank-1 predicted effector gene per locus.
-
-    Returns path to written file.
-    """
+def export_peg_list(conn: Any, study_ids: list[str], output_dir: Path) -> Path:
+    """Export PEG list — rank-1 predicted effector gene per locus."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    ph, params = _in_clause(study_ids, is_postgres(conn))
 
     if is_postgres(conn):
         cur = conn.cursor()
         cur.execute(
-            "SELECT l.locus_id, l.locus_name, l.chromosome, l.start_position, l.end_position, "
-            "s.gene_symbol, s.integration_score, s.integration_rank, s.is_predicted_effector "
-            "FROM locus_gene_scores s "
-            "JOIN loci l ON s.locus_id = l.locus_id "
-            "WHERE l.study_id = %s AND s.integration_rank = 1 "
-            "ORDER BY l.chromosome, l.start_position",
-            (study_id,),
+            f"SELECT l.locus_id, l.locus_name, l.chromosome, l.start_position, l.end_position, "
+            f"se.gene_symbol, se.integration_rank, se.is_predicted_effector "
+            f"FROM scored_evidence se "
+            f"JOIN loci l ON se.locus_id = l.locus_id "
+            f"WHERE se.study_id IN ({ph}) AND se.integration_rank = 1 "
+            f"ORDER BY l.chromosome, l.start_position",
+            params,
         )
         rows = cur.fetchall()
         cols = [desc[0] for desc in cur.description]
         cur.close()
     else:
         result = conn.execute(
-            "SELECT l.locus_id, l.locus_name, l.chromosome, l.start_position, l.end_position, "
-            "s.gene_symbol, s.integration_score, s.integration_rank, s.is_predicted_effector "
-            "FROM locus_gene_scores s "
-            "JOIN loci l ON s.locus_id = l.locus_id "
-            "WHERE l.study_id = ? AND s.integration_rank = 1 "
-            "ORDER BY l.chromosome, l.start_position",
-            [study_id],
+            f"SELECT DISTINCT l.locus_id, l.locus_name, l.chromosome, l.start_position, l.end_position, "
+            f"se.gene_symbol, se.integration_rank, se.is_predicted_effector "
+            f"FROM scored_evidence se "
+            f"JOIN loci l ON se.locus_id = l.locus_id "
+            f"WHERE se.study_id IN ({ph}) AND se.integration_rank = 1 "
+            f"ORDER BY l.chromosome, l.start_position",
+            params,
         )
         cols = [desc[0] for desc in result.description]
         rows = result.fetchall()
 
     df = pd.DataFrame(rows, columns=cols)
+    if len(df) > 0:
+        df = df.drop_duplicates(subset=["locus_id"], keep="first")
+
     out_path = output_dir / "peg_list.tsv"
     df.to_csv(out_path, sep="\t", index=False)
     logger.info(f"PEG list: {len(df)} loci → {out_path}")
     return out_path
 
 
-def export_all(conn: Any, study_id: str, output_dir: Path) -> dict[str, Path]:
+def export_all(conn: Any, study_name: str, output_dir: Path) -> dict[str, Path]:
     """Export all three PEGASUS deliverables.
 
+    Accepts a study_name (e.g. 'shrine_2023') or a direct study_id.
     Returns dict of deliverable name → file path.
     """
+    study_ids = _resolve_study_ids(conn, study_name)
+    if not study_ids:
+        raise ValueError(f"Study '{study_name}' not found")
+
     return {
-        "evidence_matrix": export_evidence_matrix(conn, study_id, output_dir),
-        "metadata": export_metadata(conn, study_id, output_dir),
-        "peg_list": export_peg_list(conn, study_id, output_dir),
+        "evidence_matrix": export_evidence_matrix(conn, study_ids, output_dir),
+        "metadata": export_metadata(conn, study_ids, output_dir),
+        "peg_list": export_peg_list(conn, study_ids, output_dir),
     }

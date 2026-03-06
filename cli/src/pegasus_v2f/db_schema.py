@@ -48,21 +48,6 @@ CREATE TABLE IF NOT EXISTS gene_search_index (
 )
 """
 
-GENE_TABLE_SUMMARY_DDL = """
-CREATE TABLE IF NOT EXISTS gene_table_summary (
-    table_name TEXT,
-    display_name TEXT,
-    gene TEXT,
-    row_count INTEGER
-)
-"""
-
-GENE_TABLE_SUMMARY_INDEXES = [
-    "CREATE INDEX IF NOT EXISTS idx_gene_table_gene ON gene_table_summary (gene)",
-    "CREATE INDEX IF NOT EXISTS idx_gene_table_table ON gene_table_summary (table_name)",
-]
-
-
 # -- All core DDL in order --
 
 CORE_DDL = [
@@ -70,8 +55,6 @@ CORE_DDL = [
     SOURCE_METADATA_DDL,
     GENE_ANNOTATIONS_DDL,
     GENE_SEARCH_INDEX_DDL,
-    GENE_TABLE_SUMMARY_DDL,
-    *GENE_TABLE_SUMMARY_INDEXES,
 ]
 
 
@@ -121,8 +104,28 @@ def has_tables(conn: Any) -> bool:
 
 def drop_all_tables(conn: Any) -> None:
     """Drop all tables. Used by build --overwrite."""
-    tables = list_tables(conn)
-    for t in tables:
-        conn.execute(f'DROP TABLE IF EXISTS "{t["table"]}"')
     if is_postgres(conn):
+        # PostgreSQL supports CASCADE
+        tables = list_tables(conn)
+        for t in tables:
+            conn.execute(f'DROP TABLE IF EXISTS "{t["table"]}" CASCADE')
         conn.commit()
+    else:
+        # DuckDB doesn't support CASCADE — retry in loop until all are gone
+        tables = [t["table"] for t in list_tables(conn)]
+        remaining = list(tables)
+        max_passes = len(remaining) + 1
+        for _ in range(max_passes):
+            if not remaining:
+                break
+            still_blocked = []
+            for t in remaining:
+                try:
+                    conn.execute(f'DROP TABLE IF EXISTS "{t}"')
+                except Exception:
+                    still_blocked.append(t)
+            remaining = still_blocked
+        if remaining:
+            raise RuntimeError(
+                f"Could not drop tables (circular FK?): {remaining}"
+            )

@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS genes (
     start_position BIGINT,
     end_position BIGINT,
     strand INTEGER,
-    genome_build VARCHAR DEFAULT 'GRCh38'
+    genome_build VARCHAR DEFAULT 'hg38'
 )
 """
 
@@ -60,19 +60,25 @@ CREATE TABLE IF NOT EXISTS variants (
     position BIGINT NOT NULL,
     ref_allele VARCHAR,
     alt_allele VARCHAR,
-    genome_build VARCHAR DEFAULT 'GRCh38'
+    genome_build VARCHAR DEFAULT 'hg38'
 )
 """
 
 STUDIES_DDL = """
 CREATE TABLE IF NOT EXISTS studies (
     study_id VARCHAR PRIMARY KEY,
+    study_name VARCHAR NOT NULL,
     trait VARCHAR NOT NULL,
     trait_description VARCHAR,
     trait_ontology_id VARCHAR,
+    study_description VARCHAR,
     gwas_source VARCHAR,
     ancestry VARCHAR,
+    sex VARCHAR,
     sample_size INTEGER,
+    doi VARCHAR,
+    year INTEGER,
+    genome_build VARCHAR DEFAULT 'hg38',
     n_loci INTEGER DEFAULT 0
 )
 """
@@ -81,74 +87,78 @@ LOCI_DDL = """
 CREATE TABLE IF NOT EXISTS loci (
     locus_id VARCHAR PRIMARY KEY,
     study_id VARCHAR NOT NULL REFERENCES studies(study_id),
+    trait VARCHAR,
     locus_name VARCHAR,
     chromosome VARCHAR NOT NULL,
     start_position BIGINT NOT NULL,
     end_position BIGINT NOT NULL,
     lead_variant_id VARCHAR,
     lead_rsid VARCHAR,
-    lead_pvalue DOUBLE,
+    lead_pvalue VARCHAR,
+    nearest_gene VARCHAR,
     locus_source VARCHAR NOT NULL DEFAULT 'curated',
     n_signals INTEGER DEFAULT 1,
     n_candidate_genes INTEGER DEFAULT 0
 )
 """
 
-# Auto-increment via sequences — works with IF NOT EXISTS in both
-# DuckDB and PostgreSQL.
-LOCUS_GENE_EVIDENCE_SEQ = (
-    "CREATE SEQUENCE IF NOT EXISTS seq_locus_gene_evidence START 1"
-)
-LOCUS_GENE_EVIDENCE_DDL = """
-CREATE TABLE IF NOT EXISTS locus_gene_evidence (
-    id INTEGER PRIMARY KEY DEFAULT nextval('seq_locus_gene_evidence'),
-    locus_id VARCHAR NOT NULL REFERENCES loci(locus_id),
+EVIDENCE_SEQ = "CREATE SEQUENCE IF NOT EXISTS seq_evidence START 1"
+EVIDENCE_DDL = """
+CREATE TABLE IF NOT EXISTS evidence (
+    evidence_id INTEGER PRIMARY KEY DEFAULT nextval('seq_evidence'),
     gene_symbol VARCHAR NOT NULL,
+    chromosome VARCHAR,
+    position BIGINT,
+    rsid VARCHAR,
     evidence_category VARCHAR NOT NULL,
-    evidence_stream VARCHAR NOT NULL DEFAULT '',
     source_tag VARCHAR NOT NULL,
+    trait VARCHAR,
     pvalue DOUBLE,
     effect_size DOUBLE,
     score DOUBLE,
     tissue VARCHAR,
     cell_type VARCHAR,
-    is_supporting BOOLEAN,
-    metadata JSON,
-    UNIQUE (locus_id, gene_symbol, evidence_category, evidence_stream, source_tag)
+    ancestry VARCHAR,
+    sex VARCHAR,
+    evidence_stream VARCHAR,
+    is_supporting BOOLEAN
 )
 """
 
-GENE_EVIDENCE_SEQ = "CREATE SEQUENCE IF NOT EXISTS seq_gene_evidence START 1"
-GENE_EVIDENCE_DDL = """
-CREATE TABLE IF NOT EXISTS gene_evidence (
-    id INTEGER PRIMARY KEY DEFAULT nextval('seq_gene_evidence'),
+EVIDENCE_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_evidence_source_tag ON evidence (source_tag)",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_gene_symbol ON evidence (gene_symbol)",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_chr_pos ON evidence (chromosome, position)",
+]
+
+SCORED_EVIDENCE_DDL = """
+CREATE TABLE IF NOT EXISTS scored_evidence (
+    locus_id VARCHAR NOT NULL,
+    study_id VARCHAR NOT NULL,
     gene_symbol VARCHAR NOT NULL,
-    evidence_category VARCHAR NOT NULL,
-    evidence_type VARCHAR NOT NULL,
-    source_tag VARCHAR NOT NULL,
-    trait VARCHAR NOT NULL DEFAULT '',
+    evidence_category VARCHAR,
+    source_tag VARCHAR,
+    trait VARCHAR,
+    pvalue DOUBLE,
+    effect_size DOUBLE,
     score DOUBLE,
     tissue VARCHAR,
     cell_type VARCHAR,
-    metadata JSON,
-    UNIQUE (gene_symbol, evidence_category, evidence_type, source_tag, trait)
+    rsid VARCHAR,
+    ancestry VARCHAR,
+    sex VARCHAR,
+    match_type VARCHAR,
+    integration_rank INTEGER,
+    is_predicted_effector BOOLEAN,
+    n_candidate_genes INTEGER
 )
 """
 
-LOCUS_GENE_SCORES_DDL = """
-CREATE TABLE IF NOT EXISTS locus_gene_scores (
-    locus_id VARCHAR NOT NULL,
-    gene_symbol VARCHAR NOT NULL,
-    distance_to_lead_kb DOUBLE,
-    is_nearest_gene BOOLEAN DEFAULT FALSE,
-    is_within_locus BOOLEAN DEFAULT FALSE,
-    integration_method VARCHAR,
-    integration_score DOUBLE,
-    integration_rank INTEGER,
-    is_predicted_effector BOOLEAN DEFAULT FALSE,
-    PRIMARY KEY (locus_id, gene_symbol)
-)
-"""
+SCORED_EVIDENCE_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_scored_locus_gene ON scored_evidence (locus_id, gene_symbol)",
+    "CREATE INDEX IF NOT EXISTS idx_scored_study ON scored_evidence (study_id)",
+    "CREATE INDEX IF NOT EXISTS idx_scored_gene ON scored_evidence (gene_symbol)",
+]
 
 DATA_SOURCES_DDL = """
 CREATE TABLE IF NOT EXISTS data_sources (
@@ -172,11 +182,11 @@ PEGASUS_DDL = [
     VARIANTS_DDL,
     STUDIES_DDL,
     LOCI_DDL,
-    LOCUS_GENE_EVIDENCE_SEQ,
-    LOCUS_GENE_EVIDENCE_DDL,
-    GENE_EVIDENCE_SEQ,
-    GENE_EVIDENCE_DDL,
-    LOCUS_GENE_SCORES_DDL,
+    EVIDENCE_SEQ,
+    EVIDENCE_DDL,
+    *EVIDENCE_INDEXES,
+    SCORED_EVIDENCE_DDL,
+    *SCORED_EVIDENCE_INDEXES,
     DATA_SOURCES_DDL,
 ]
 

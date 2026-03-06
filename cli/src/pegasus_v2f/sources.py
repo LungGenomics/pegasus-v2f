@@ -9,7 +9,7 @@ from typing import Any
 
 import yaml
 
-from pegasus_v2f.db import is_postgres, write_table
+from pegasus_v2f.db import is_postgres, raw_table_name, write_table
 from pegasus_v2f.db_meta import read_meta, write_meta
 from pegasus_v2f.loaders import load_source
 from pegasus_v2f.transform import apply_transformations, clean_for_db
@@ -53,28 +53,23 @@ def add_source(
         df = apply_transformations(df, transformations)
     df = clean_for_db(df)
 
-    evidence = source.get("evidence")
-    if evidence and config:
-        # Evidence-aware path
-        from pegasus_v2f.evidence import route_evidence_source
-        route_evidence_source(conn, source, df, config)
+    # Always write the raw table (all original columns, queryable)
+    write_table(conn, raw_table_name(name), df)
 
-        if not no_score and config.get("pegasus"):
-            from pegasus_v2f.scoring import compute_locus_gene_scores
-            compute_locus_gene_scores(conn, config)
-    else:
-        # Raw table path
-        write_table(conn, name, df)
+    evidence_blocks = source.get("evidence") or []
+    if evidence_blocks:
+        # Load evidence into the unified evidence table
+        from pegasus_v2f.evidence_loader import load_all_evidence
+        load_all_evidence(conn, source, df)
 
     # Update stored config
     _append_source_to_meta(conn, source)
 
-    # Update source_metadata table (only for raw sources)
-    if not evidence:
-        try:
-            _upsert_source_metadata(conn, source, len(df))
-        except Exception:
-            pass  # source_metadata may not exist outside full builds
+    # Update source_metadata table
+    try:
+        _upsert_source_metadata(conn, source, len(df))
+    except Exception:
+        pass  # source_metadata may not exist outside full builds
 
     logger.info(f"Added source '{name}': {len(df)} rows")
     return len(df)
@@ -106,24 +101,15 @@ def update_source(
         df = apply_transformations(df, transformations)
     df = clean_for_db(df)
 
-    evidence = source.get("evidence")
-    if evidence and config:
-        # Delete old evidence rows by source_tag
-        source_tag = evidence.get("source_tag", "")
-        if source_tag:
-            _delete_evidence_by_source_tag(conn, source_tag)
+    # Always refresh the raw table
+    write_table(conn, raw_table_name(name), df)
 
-        # Re-load through evidence routing
-        from pegasus_v2f.evidence import route_evidence_source
-        route_evidence_source(conn, source, df, config)
-
-        # Re-score
-        if config.get("pegasus"):
-            from pegasus_v2f.scoring import compute_locus_gene_scores
-            compute_locus_gene_scores(conn, config)
+    evidence_blocks = source.get("evidence") or []
+    if evidence_blocks:
+        # Re-load evidence (loader handles cleanup per source_tag)
+        from pegasus_v2f.evidence_loader import load_all_evidence
+        load_all_evidence(conn, source, df)
     else:
-        # Replace raw table
-        write_table(conn, name, df)
         try:
             _upsert_source_metadata(conn, source, len(df))
         except Exception:
@@ -143,35 +129,34 @@ def remove_source(conn: Any, name: str, config: dict | None = None) -> None:
     sources = list_sources(conn)
     source = next((s for s in sources if s["name"] == name), None)
 
-    evidence = source.get("evidence") if source else None
-    if evidence:
-        source_tag = evidence.get("source_tag", "")
-        role = evidence.get("role")
+    # Always drop the raw table
+    raw_name = raw_table_name(name)
+    conn.execute(f'DROP TABLE IF EXISTS "{raw_name}"')
 
-        if source_tag:
-            _delete_evidence_by_source_tag(conn, source_tag)
+    evidence_blocks = (source.get("evidence") or []) if source else []
+    if evidence_blocks:
+        for block in evidence_blocks:
+            source_tag = block.get("source_tag", "")
+            role = block.get("role")
 
-            # Locus definition sources also create studies, loci, and scores
-            if role == "locus_definition":
-                _delete_locus_definition_data(conn, source_tag)
+            if source_tag:
+                _delete_evidence_by_source_tag(conn, source_tag)
 
-            # Remove from data_sources provenance table
-            if is_postgres(conn):
-                cur = conn.cursor()
-                cur.execute("DELETE FROM data_sources WHERE source_tag = %s", (source_tag,))
-                conn.commit()
-                cur.close()
-            else:
-                conn.execute("DELETE FROM data_sources WHERE source_tag = ?", [source_tag])
+                # Locus definition sources also create studies, loci, and scores
+                if role == "locus_definition":
+                    _delete_locus_definition_data(conn, source_tag)
 
-        # Re-score
-        if config and config.get("pegasus"):
-            from pegasus_v2f.scoring import compute_locus_gene_scores
-            compute_locus_gene_scores(conn, config)
+                # Remove from data_sources provenance table
+                if is_postgres(conn):
+                    cur = conn.cursor()
+                    cur.execute("DELETE FROM data_sources WHERE source_tag = %s", (source_tag,))
+                    conn.commit()
+                    cur.close()
+                else:
+                    conn.execute("DELETE FROM data_sources WHERE source_tag = ?", [source_tag])
+
+        # Note: rescoring is now a separate step via `v2f rescore`
     else:
-        # Raw table — drop it
-        conn.execute(f'DROP TABLE IF EXISTS "{name}"')
-
         # Remove from source_metadata
         try:
             if is_postgres(conn):
@@ -201,22 +186,17 @@ def list_sources(conn: Any) -> list[dict]:
 
 
 def _delete_locus_definition_data(conn: Any, source_tag: str) -> None:
-    """Delete orphaned loci, scores, and studies after evidence rows were removed.
+    """Delete orphaned scored_evidence, loci, and studies.
 
     Called after _delete_evidence_by_source_tag has already removed the
-    locus_gene_evidence rows.  This cleans up loci that no longer have any
-    evidence, their scores, and studies with no remaining loci.
+    evidence rows. Cleans up scored_evidence referencing removed evidence,
+    then orphaned loci and studies.
     """
     try:
         if is_postgres(conn):
             cur = conn.cursor()
             cur.execute(
-                "DELETE FROM locus_gene_scores WHERE locus_id NOT IN "
-                "(SELECT DISTINCT locus_id FROM locus_gene_evidence)"
-            )
-            cur.execute(
-                "DELETE FROM loci WHERE locus_id NOT IN "
-                "(SELECT DISTINCT locus_id FROM locus_gene_evidence)"
+                "DELETE FROM scored_evidence WHERE source_tag = %s", (source_tag,)
             )
             cur.execute(
                 "DELETE FROM studies WHERE study_id NOT IN "
@@ -226,12 +206,7 @@ def _delete_locus_definition_data(conn: Any, source_tag: str) -> None:
             cur.close()
         else:
             conn.execute(
-                "DELETE FROM locus_gene_scores WHERE locus_id NOT IN "
-                "(SELECT DISTINCT locus_id FROM locus_gene_evidence)"
-            )
-            conn.execute(
-                "DELETE FROM loci WHERE locus_id NOT IN "
-                "(SELECT DISTINCT locus_id FROM locus_gene_evidence)"
+                "DELETE FROM scored_evidence WHERE source_tag = ?", [source_tag]
             )
             conn.execute(
                 "DELETE FROM studies WHERE study_id NOT IN "
@@ -242,23 +217,17 @@ def _delete_locus_definition_data(conn: Any, source_tag: str) -> None:
 
 
 def _delete_evidence_by_source_tag(conn: Any, source_tag: str) -> None:
-    """Delete evidence rows from both evidence tables for a given source_tag."""
+    """Delete evidence rows for a given source_tag."""
     if is_postgres(conn):
         cur = conn.cursor()
         cur.execute(
-            "DELETE FROM locus_gene_evidence WHERE source_tag = %s", (source_tag,)
-        )
-        cur.execute(
-            "DELETE FROM gene_evidence WHERE source_tag = %s", (source_tag,)
+            "DELETE FROM evidence WHERE source_tag = %s", (source_tag,)
         )
         conn.commit()
         cur.close()
     else:
         conn.execute(
-            "DELETE FROM locus_gene_evidence WHERE source_tag = ?", [source_tag]
-        )
-        conn.execute(
-            "DELETE FROM gene_evidence WHERE source_tag = ?", [source_tag]
+            "DELETE FROM evidence WHERE source_tag = ?", [source_tag]
         )
 
 

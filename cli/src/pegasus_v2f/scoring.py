@@ -1,4 +1,4 @@
-"""Integration scoring — criteria count method for gene prioritization."""
+"""Materialization and scoring — join evidence × loci × genes into scored_evidence."""
 
 from __future__ import annotations
 
@@ -10,326 +10,393 @@ from pegasus_v2f.db import is_postgres
 logger = logging.getLogger(__name__)
 
 
-def compute_locus_gene_scores(conn: Any, config: dict) -> int:
-    """Compute integration scores for all locus-gene pairs.
+def materialize_scored_evidence(
+    conn: Any,
+    config: dict,
+    study_name: str | None = None,
+) -> int:
+    """Materialize scored_evidence from evidence × loci × genes.
 
-    Populates locus_gene_scores table. Returns number of rows written.
+    For each locus:
+      1. Find candidate genes (gene coords overlap locus window) → match_type='gene'
+      2. Find variant-level evidence (chr/pos in locus window) → match_type='position'
+      3. Find gene-level evidence (gene_symbol in candidates) → match_type='gene'
+      4. Score and rank genes within each locus
+
+    Args:
+        conn: Open database connection.
+        config: Full config dict.
+        study_name: If set, only materialize for this study's loci.
+
+    Returns:
+        Number of scored_evidence rows written.
     """
-    integration = config.get("pegasus", {}).get("integration", {})
-    method = integration.get("method", "criteria_count_v1")
-    effector_threshold = float(integration.get("effector_threshold", 0.25))
-    criteria = integration.get("criteria", [])
-
-    # Clear existing scores
-    conn.execute("DELETE FROM locus_gene_scores")
-    if is_postgres(conn):
-        conn.commit()
-
-    # Get all loci
-    if is_postgres(conn):
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT locus_id, chromosome, start_position, end_position, "
-            "lead_variant_id, lead_rsid FROM loci"
-        )
-        loci = cur.fetchall()
-        cur.close()
+    # Clear scored_evidence (all or for target study)
+    if study_name:
+        if is_postgres(conn):
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM scored_evidence WHERE study_id IN "
+                "(SELECT study_id FROM studies WHERE study_name = %s)",
+                (study_name,),
+            )
+            conn.commit()
+            cur.close()
+        else:
+            conn.execute(
+                "DELETE FROM scored_evidence WHERE study_id IN "
+                "(SELECT study_id FROM studies WHERE study_name = ?)",
+                [study_name],
+            )
     else:
-        loci = conn.execute(
-            "SELECT locus_id, chromosome, start_position, end_position, "
-            "lead_variant_id, lead_rsid FROM loci"
-        ).fetchall()
+        conn.execute("DELETE FROM scored_evidence")
+        if is_postgres(conn):
+            conn.commit()
 
+    # Ensure genes table has data (candidate gene enumeration needs coordinates)
+    try:
+        gene_count = conn.execute("SELECT COUNT(*) FROM genes").fetchone()[0]
+        if gene_count == 0:
+            logger.info("genes table is empty — fetching annotations")
+            from pegasus_v2f.annotate import create_gene_annotations
+            # Collect all gene symbols from evidence
+            rows = conn.execute(
+                "SELECT DISTINCT gene_symbol FROM evidence"
+            ).fetchall()
+            all_genes = [r[0] for r in rows if r[0]]
+            if all_genes:
+                create_gene_annotations(conn, all_genes, config)
+                logger.info(f"Fetched annotations for {len(all_genes)} genes")
+    except Exception as e:
+        logger.warning(f"Could not check/fetch gene annotations: {e}")
+
+    # Get loci (all or for target study)
+    loci = _get_loci(conn, study_name)
     if not loci:
         logger.warning("No loci found — skipping scoring")
         return 0
 
     total_rows = 0
 
-    for locus_row in loci:
-        locus_id = locus_row[0]
-        locus_chr = locus_row[1]
-        locus_start = locus_row[2]
-        locus_end = locus_row[3]
-        lead_pos = (locus_start + locus_end) // 2  # midpoint as proxy
+    for locus in loci:
+        locus_id = locus["locus_id"]
+        study_id = locus["study_id"]
+        locus_chr = locus["chromosome"]
+        locus_start = locus["start_position"]
+        locus_end = locus["end_position"]
 
-        # Collect candidate genes from evidence tables
-        genes = _get_candidate_genes(conn, locus_id)
-        if not genes:
-            continue
+        # 1. Candidate genes by geometry (gene coords overlap locus window)
+        candidate_genes = _get_candidate_genes_by_geometry(
+            conn, locus_chr, locus_start, locus_end
+        )
 
-        scores = []
-        for gene_symbol in genes:
-            # Distance to locus midpoint
-            gene_pos = _get_gene_midpoint(conn, gene_symbol)
-            if gene_pos is not None:
-                distance_kb = abs(gene_pos - lead_pos) / 1000.0
-                is_within = _gene_overlaps_locus(
-                    conn, gene_symbol, locus_chr, locus_start, locus_end
-                )
-            else:
-                distance_kb = None
-                is_within = None
+        # 2. Variant-level evidence in locus window
+        variant_evidence = _get_variant_evidence_in_window(
+            conn, locus_chr, locus_start, locus_end
+        )
 
-            # Count criteria met
-            criteria_met = _criteria_count_v1(
-                conn, locus_id, gene_symbol, criteria
+        # 3. Gene-level evidence for candidate genes + any genes from variant evidence
+        all_gene_symbols = set(candidate_genes)
+        for ev in variant_evidence:
+            all_gene_symbols.add(ev["gene_symbol"])
+
+        gene_evidence = _get_gene_level_evidence(conn, all_gene_symbols)
+
+        # Collect all evidence rows for this locus
+        evidence_rows = []
+
+        # Variant evidence → match_type='position'
+        for ev in variant_evidence:
+            evidence_rows.append({**ev, "match_type": "position"})
+
+        # Gene evidence → match_type='gene'
+        for ev in gene_evidence:
+            evidence_rows.append({**ev, "match_type": "gene"})
+
+        # Group by gene, count categories, compute rank
+        gene_scores = _score_genes(evidence_rows, candidate_genes)
+        n_candidates = len(set(candidate_genes) | {ev["gene_symbol"] for ev in evidence_rows})
+
+        # Write scored_evidence rows
+        for ev in evidence_rows:
+            gene = ev["gene_symbol"]
+            gs = gene_scores.get(gene, {})
+            _insert_scored_evidence(
+                conn,
+                locus_id=locus_id,
+                study_id=study_id,
+                evidence=ev,
+                integration_rank=gs.get("rank"),
+                is_predicted_effector=gs.get("is_predicted_effector", False),
+                n_candidate_genes=n_candidates,
             )
-
-            # Total evidence types
-            n_evidence = _count_evidence_types(conn, locus_id, gene_symbol)
-
-            # Integration score = criteria_met + normalized evidence count
-            integration_score = criteria_met + (n_evidence * 0.1)
-
-            scores.append({
-                "locus_id": locus_id,
-                "gene_symbol": gene_symbol,
-                "distance_to_lead_kb": distance_kb,
-                "is_within_locus": is_within,
-                "integration_method": method,
-                "integration_score": integration_score,
-                "criteria_met": criteria_met,
-            })
-
-        if not scores:
-            continue
-
-        # Rank within locus (higher score = better rank)
-        scores.sort(key=lambda s: -(s["integration_score"] or 0))
-        for rank, s in enumerate(scores, 1):
-            s["integration_rank"] = rank
-
-        # Mark nearest gene
-        scored_with_distance = [s for s in scores if s["distance_to_lead_kb"] is not None]
-        if scored_with_distance:
-            nearest = min(scored_with_distance, key=lambda s: s["distance_to_lead_kb"])
-            nearest["is_nearest_gene"] = True
-
-        # Mark predicted effectors
-        if scores:
-            max_score = scores[0]["integration_score"]
-            if max_score > 0:
-                for s in scores:
-                    s["is_predicted_effector"] = (
-                        s["integration_score"] / max_score >= effector_threshold
-                    )
-
-        # Write to locus_gene_scores
-        for s in scores:
-            _insert_score(conn, s)
             total_rows += 1
+
+        # Also write rows for candidate genes with NO evidence
+        genes_with_evidence = {ev["gene_symbol"] for ev in evidence_rows}
+        for gene in candidate_genes:
+            if gene not in genes_with_evidence:
+                _insert_scored_evidence(
+                    conn,
+                    locus_id=locus_id,
+                    study_id=study_id,
+                    evidence={"gene_symbol": gene, "match_type": "gene"},
+                    integration_rank=gene_scores.get(gene, {}).get("rank"),
+                    is_predicted_effector=False,
+                    n_candidate_genes=n_candidates,
+                )
+                total_rows += 1
+
+    # Update candidate gene counts on loci table
+    conn.execute("""
+        UPDATE loci SET n_candidate_genes = (
+            SELECT COUNT(DISTINCT gene_symbol) FROM scored_evidence
+            WHERE scored_evidence.locus_id = loci.locus_id
+        )
+    """)
 
     if is_postgres(conn):
         conn.commit()
 
-    logger.info(f"Computed scores for {total_rows} locus-gene pairs")
+    # Rebuild gene search index
+    try:
+        from pegasus_v2f.annotate import create_pegasus_search_index
+        create_pegasus_search_index(conn)
+        logger.info("Rebuilt gene_search_index")
+    except Exception as e:
+        logger.warning(f"Could not rebuild gene_search_index: {e}")
+
+    logger.info(f"Materialized {total_rows} scored_evidence rows")
     return total_rows
 
 
-def _get_candidate_genes(conn: Any, locus_id: str) -> list[str]:
-    """Get all candidate genes for a locus from evidence tables."""
+def _get_loci(conn: Any, study_name: str | None) -> list[dict]:
+    """Get loci, optionally filtered by study_name."""
+    if study_name:
+        if is_postgres(conn):
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT l.locus_id, l.study_id, l.chromosome, l.start_position, l.end_position "
+                "FROM loci l JOIN studies s ON l.study_id = s.study_id "
+                "WHERE s.study_name = %s",
+                (study_name,),
+            )
+            rows = cur.fetchall()
+            cur.close()
+        else:
+            rows = conn.execute(
+                "SELECT l.locus_id, l.study_id, l.chromosome, l.start_position, l.end_position "
+                "FROM loci l JOIN studies s ON l.study_id = s.study_id "
+                "WHERE s.study_name = ?",
+                [study_name],
+            ).fetchall()
+    else:
+        if is_postgres(conn):
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT locus_id, study_id, chromosome, start_position, end_position FROM loci"
+            )
+            rows = cur.fetchall()
+            cur.close()
+        else:
+            rows = conn.execute(
+                "SELECT locus_id, study_id, chromosome, start_position, end_position FROM loci"
+            ).fetchall()
+
+    return [
+        {
+            "locus_id": r[0],
+            "study_id": r[1],
+            "chromosome": r[2],
+            "start_position": r[3],
+            "end_position": r[4],
+        }
+        for r in rows
+    ]
+
+
+def _get_candidate_genes_by_geometry(
+    conn: Any, chromosome: str, start: int, end: int,
+) -> list[str]:
+    """Find genes whose coordinates overlap the locus window."""
     if is_postgres(conn):
         cur = conn.cursor()
         cur.execute(
-            "SELECT DISTINCT gene_symbol FROM locus_gene_evidence "
-            "WHERE locus_id = %s AND gene_symbol != ''",
-            (locus_id,),
+            "SELECT gene_symbol FROM genes "
+            "WHERE chromosome = %s AND start_position <= %s AND end_position >= %s",
+            (str(chromosome), end, start),
         )
         rows = cur.fetchall()
         cur.close()
     else:
         rows = conn.execute(
-            "SELECT DISTINCT gene_symbol FROM locus_gene_evidence "
-            "WHERE locus_id = ? AND gene_symbol != ''",
-            [locus_id],
+            "SELECT gene_symbol FROM genes "
+            "WHERE chromosome = ? AND start_position <= ? AND end_position >= ?",
+            [str(chromosome), end, start],
         ).fetchall()
+
     return [r[0] for r in rows]
 
 
-def _get_gene_midpoint(conn: Any, gene_symbol: str) -> int | None:
-    """Get midpoint of a gene from the genes table."""
+def _get_variant_evidence_in_window(
+    conn: Any, chromosome: str, start: int, end: int,
+) -> list[dict]:
+    """Get variant-level evidence (has chr/pos) within the locus window."""
+    cols = (
+        "gene_symbol, evidence_category, source_tag, trait, pvalue, "
+        "effect_size, score, tissue, cell_type, rsid, ancestry, sex"
+    )
     if is_postgres(conn):
         cur = conn.cursor()
         cur.execute(
-            "SELECT start_position, end_position FROM genes WHERE gene_symbol = %s",
-            (gene_symbol,),
+            f"SELECT {cols} FROM evidence "
+            "WHERE chromosome = %s AND position >= %s AND position <= %s",
+            (str(chromosome), start, end),
         )
-        row = cur.fetchone()
+        rows = cur.fetchall()
         cur.close()
     else:
-        row = conn.execute(
-            "SELECT start_position, end_position FROM genes WHERE gene_symbol = ?",
-            [gene_symbol],
-        ).fetchone()
+        rows = conn.execute(
+            f"SELECT {cols} FROM evidence "
+            "WHERE chromosome = ? AND position >= ? AND position <= ?",
+            [str(chromosome), start, end],
+        ).fetchall()
 
-    if row and row[0] is not None and row[1] is not None:
-        return (row[0] + row[1]) // 2
-    return None
+    return [_evidence_row_to_dict(r) for r in rows]
 
 
-def _gene_overlaps_locus(
-    conn: Any, gene_symbol: str,
-    locus_chr: str, locus_start: int, locus_end: int,
-) -> bool | None:
-    """Check if a gene's coordinates overlap a locus boundary."""
+def _get_gene_level_evidence(conn: Any, gene_symbols: set[str]) -> list[dict]:
+    """Get gene-level evidence (no chr/pos) for a set of gene symbols."""
+    if not gene_symbols:
+        return []
+
+    cols = (
+        "gene_symbol, evidence_category, source_tag, trait, pvalue, "
+        "effect_size, score, tissue, cell_type, rsid, ancestry, sex"
+    )
+
+    # Build IN clause
+    placeholders = ", ".join(["?"] * len(gene_symbols))
+    genes_list = list(gene_symbols)
+
     if is_postgres(conn):
+        placeholders = ", ".join(["%s"] * len(gene_symbols))
         cur = conn.cursor()
         cur.execute(
-            "SELECT chromosome, start_position, end_position FROM genes WHERE gene_symbol = %s",
-            (gene_symbol,),
+            f"SELECT {cols} FROM evidence "
+            f"WHERE chromosome IS NULL AND gene_symbol IN ({placeholders})",
+            genes_list,
         )
-        row = cur.fetchone()
+        rows = cur.fetchall()
         cur.close()
     else:
-        row = conn.execute(
-            "SELECT chromosome, start_position, end_position FROM genes WHERE gene_symbol = ?",
-            [gene_symbol],
-        ).fetchone()
+        rows = conn.execute(
+            f"SELECT {cols} FROM evidence "
+            f"WHERE chromosome IS NULL AND gene_symbol IN ({placeholders})",
+            genes_list,
+        ).fetchall()
 
-    if not row or row[1] is None:
-        return None
-    gene_chr, gene_start, gene_end = str(row[0]), row[1], row[2]
-    if gene_chr != str(locus_chr):
-        return False
-    return gene_start <= locus_end and gene_end >= locus_start
+    return [_evidence_row_to_dict(r) for r in rows]
 
 
-def _criteria_count_v1(
-    conn: Any, locus_id: str, gene_symbol: str, criteria: list[dict],
-) -> int:
-    """Count how many integration criteria a gene meets at a locus."""
-    met = 0
-    for criterion in criteria:
-        crit_type = criterion.get("type", "evidence")
-        if crit_type == "computed":
-            # Computed criteria (like nearest_gene) are handled post-hoc
-            continue
-
-        category = criterion.get("category")
-        threshold_field = criterion.get("threshold_field", "score")
-        threshold = criterion.get("threshold")
-
-        if not category:
-            continue
-
-        # Check if there's evidence in this category meeting the threshold
-        if is_postgres(conn):
-            cur = conn.cursor()
-            if threshold is not None:
-                cur.execute(
-                    f"SELECT 1 FROM locus_gene_evidence "
-                    f"WHERE locus_id = %s AND gene_symbol = %s AND evidence_category = %s "
-                    f"AND {threshold_field} >= %s LIMIT 1",
-                    (locus_id, gene_symbol, category, threshold),
-                )
-            else:
-                cur.execute(
-                    "SELECT 1 FROM locus_gene_evidence "
-                    "WHERE locus_id = %s AND gene_symbol = %s AND evidence_category = %s LIMIT 1",
-                    (locus_id, gene_symbol, category),
-                )
-            found = cur.fetchone() is not None
-            cur.close()
-        else:
-            if threshold is not None:
-                found = conn.execute(
-                    f"SELECT 1 FROM locus_gene_evidence "
-                    f"WHERE locus_id = ? AND gene_symbol = ? AND evidence_category = ? "
-                    f"AND {threshold_field} >= ? LIMIT 1",
-                    [locus_id, gene_symbol, category, threshold],
-                ).fetchone() is not None
-            else:
-                found = conn.execute(
-                    "SELECT 1 FROM locus_gene_evidence "
-                    "WHERE locus_id = ? AND gene_symbol = ? AND evidence_category = ? LIMIT 1",
-                    [locus_id, gene_symbol, category],
-                ).fetchone() is not None
-
-        if found:
-            met += 1
-
-    return met
+def _evidence_row_to_dict(row: tuple) -> dict:
+    """Convert a raw evidence query row to a dict."""
+    return {
+        "gene_symbol": row[0],
+        "evidence_category": row[1],
+        "source_tag": row[2],
+        "trait": row[3],
+        "pvalue": row[4],
+        "effect_size": row[5],
+        "score": row[6],
+        "tissue": row[7],
+        "cell_type": row[8],
+        "rsid": row[9],
+        "ancestry": row[10],
+        "sex": row[11],
+    }
 
 
-def _count_evidence_types(conn: Any, locus_id: str, gene_symbol: str) -> int:
-    """Count distinct evidence categories for a gene at a locus."""
+def _score_genes(evidence_rows: list[dict], candidate_genes: list[str]) -> dict:
+    """Score genes by counting distinct evidence categories.
+
+    Returns dict of gene_symbol → {score, rank, is_predicted_effector}.
+    """
+    # Count distinct evidence categories per gene
+    gene_categories: dict[str, set[str]] = {}
+    all_genes = set(candidate_genes)
+
+    for ev in evidence_rows:
+        gene = ev["gene_symbol"]
+        all_genes.add(gene)
+        cat = ev.get("evidence_category")
+        if cat:
+            gene_categories.setdefault(gene, set()).add(cat)
+
+    # Score = number of distinct categories
+    scored = []
+    for gene in all_genes:
+        cats = gene_categories.get(gene, set())
+        scored.append({"gene_symbol": gene, "score": len(cats)})
+
+    # Rank (higher score = rank 1)
+    scored.sort(key=lambda s: -s["score"])
+    result = {}
+    for rank, s in enumerate(scored, 1):
+        is_effector = False
+        if scored[0]["score"] > 0:
+            is_effector = s["score"] / scored[0]["score"] >= 0.25
+        result[s["gene_symbol"]] = {
+            "rank": rank,
+            "is_predicted_effector": is_effector,
+        }
+
+    return result
+
+
+def _insert_scored_evidence(
+    conn: Any, *,
+    locus_id: str,
+    study_id: str,
+    evidence: dict,
+    integration_rank: int | None,
+    is_predicted_effector: bool,
+    n_candidate_genes: int,
+) -> None:
+    """Insert a single scored_evidence row."""
+    values = [
+        locus_id,
+        study_id,
+        evidence["gene_symbol"],
+        evidence.get("evidence_category"),
+        evidence.get("source_tag"),
+        evidence.get("trait"),
+        evidence.get("pvalue"),
+        evidence.get("effect_size"),
+        evidence.get("score"),
+        evidence.get("tissue"),
+        evidence.get("cell_type"),
+        evidence.get("rsid"),
+        evidence.get("ancestry"),
+        evidence.get("sex"),
+        evidence.get("match_type"),
+        integration_rank,
+        is_predicted_effector,
+        n_candidate_genes,
+    ]
+
+    cols = (
+        "locus_id, study_id, gene_symbol, evidence_category, source_tag, "
+        "trait, pvalue, effect_size, score, tissue, cell_type, rsid, "
+        "ancestry, sex, match_type, integration_rank, is_predicted_effector, "
+        "n_candidate_genes"
+    )
+
     if is_postgres(conn):
+        placeholders = ", ".join(["%s"] * len(values))
         cur = conn.cursor()
-        cur.execute(
-            "SELECT COUNT(DISTINCT evidence_category) FROM locus_gene_evidence "
-            "WHERE locus_id = %s AND gene_symbol = %s",
-            (locus_id, gene_symbol),
-        )
-        row = cur.fetchone()
+        cur.execute(f"INSERT INTO scored_evidence ({cols}) VALUES ({placeholders})", values)
         cur.close()
     else:
-        row = conn.execute(
-            "SELECT COUNT(DISTINCT evidence_category) FROM locus_gene_evidence "
-            "WHERE locus_id = ? AND gene_symbol = ?",
-            [locus_id, gene_symbol],
-        ).fetchone()
-
-    # Also count gene-level evidence
-    if is_postgres(conn):
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT COUNT(DISTINCT evidence_category) FROM gene_evidence "
-            "WHERE gene_symbol = %s",
-            (gene_symbol,),
-        )
-        gene_row = cur.fetchone()
-        cur.close()
-    else:
-        gene_row = conn.execute(
-            "SELECT COUNT(DISTINCT evidence_category) FROM gene_evidence "
-            "WHERE gene_symbol = ?",
-            [gene_symbol],
-        ).fetchone()
-
-    return (row[0] if row else 0) + (gene_row[0] if gene_row else 0)
-
-
-def _insert_score(conn: Any, s: dict) -> None:
-    """Insert a single score row."""
-    if is_postgres(conn):
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO locus_gene_scores "
-            "(locus_id, gene_symbol, distance_to_lead_kb, is_nearest_gene, "
-            "is_within_locus, integration_method, integration_score, "
-            "integration_rank, is_predicted_effector) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-            "ON CONFLICT (locus_id, gene_symbol) DO UPDATE SET "
-            "integration_score = EXCLUDED.integration_score, "
-            "integration_rank = EXCLUDED.integration_rank",
-            (
-                s["locus_id"], s["gene_symbol"],
-                s.get("distance_to_lead_kb"),
-                s.get("is_nearest_gene", False),
-                s.get("is_within_locus"),
-                s.get("integration_method"),
-                s.get("integration_score"),
-                s.get("integration_rank"),
-                s.get("is_predicted_effector", False),
-            ),
-        )
-        cur.close()
-    else:
-        conn.execute(
-            "INSERT OR REPLACE INTO locus_gene_scores "
-            "(locus_id, gene_symbol, distance_to_lead_kb, is_nearest_gene, "
-            "is_within_locus, integration_method, integration_score, "
-            "integration_rank, is_predicted_effector) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                s["locus_id"], s["gene_symbol"],
-                s.get("distance_to_lead_kb"),
-                s.get("is_nearest_gene", False),
-                s.get("is_within_locus"),
-                s.get("integration_method"),
-                s.get("integration_score"),
-                s.get("integration_rank"),
-                s.get("is_predicted_effector", False),
-            ],
-        )
+        placeholders = ", ".join(["?"] * len(values))
+        conn.execute(f"INSERT INTO scored_evidence ({cols}) VALUES ({placeholders})", values)

@@ -7,7 +7,7 @@ from typing import Any
 
 import pandas as pd
 
-from pegasus_v2f.db import is_postgres, write_table
+from pegasus_v2f.db import is_postgres, raw_table_name, write_table
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +20,11 @@ def create_gene_annotations(
     genes: list[str],
     config: dict,
 ) -> None:
-    """Fetch gene annotations from Ensembl via biomaRt-style REST API and write to DB.
+    """Fetch gene annotations from Ensembl and write to DB.
 
-    Falls back to a simple lookup table if Ensembl is unavailable.
+    In PEGASUS mode (``genes`` table exists), inserts into the ``genes``
+    table with column mapping (gene → gene_symbol, display_name → gene_name).
+    In legacy mode, writes to ``gene_annotations`` as before.
     """
     ga_config = config.get("gene_annotations", {})
     genome_build = config.get("database", {}).get("genome_build", "hg38")
@@ -34,6 +36,7 @@ def create_gene_annotations(
         df = pd.DataFrame({
             "gene": genes,
             "ensembl_gene_id": [None] * len(genes),
+            "gene_name": [None] * len(genes),
             "chromosome": [None] * len(genes),
             "start_position": [None] * len(genes),
             "end_position": [None] * len(genes),
@@ -46,7 +49,89 @@ def create_gene_annotations(
     if "chromosome" in df.columns:
         df = df[df["chromosome"].isin(VALID_CHROMOSOMES) | df["chromosome"].isna()]
 
-    write_table(conn, "gene_annotations", df)
+    # PEGASUS mode: insert into genes table
+    if _has_table(conn, "genes"):
+        _insert_into_genes(conn, df)
+    else:
+        # Legacy mode: write to gene_annotations
+        write_table(conn, "gene_annotations", df)
+
+
+def _has_table(conn: Any, table_name: str) -> bool:
+    """Check if a table exists in the database."""
+    try:
+        if is_postgres(conn):
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_name = %s",
+                (table_name,),
+            )
+            result = cur.fetchone() is not None
+            cur.close()
+            return result
+        else:
+            result = conn.execute(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
+                [table_name],
+            ).fetchone()
+            return result is not None
+    except Exception:
+        return False
+
+
+def _insert_into_genes(conn: Any, df: pd.DataFrame) -> None:
+    """Insert gene annotation data into the PEGASUS ``genes`` table.
+
+    Uses ON CONFLICT DO UPDATE so genes already present (e.g. from
+    a prior source) get their coordinates filled in.
+    """
+    if df.empty:
+        return
+
+    # Map legacy column names → PEGASUS schema
+    insert_df = df.rename(columns={"gene": "gene_symbol"})
+    if "gene_name" not in insert_df.columns:
+        insert_df["gene_name"] = None
+
+    cols = [
+        "gene_symbol", "ensembl_gene_id", "gene_name",
+        "chromosome", "start_position", "end_position",
+        "strand", "genome_build",
+    ]
+    insert_df = insert_df[[c for c in cols if c in insert_df.columns]]
+
+    upsert_sql = """
+        INSERT INTO genes (gene_symbol, ensembl_gene_id, gene_name,
+            chromosome, start_position, end_position, strand, genome_build)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (gene_symbol) DO UPDATE SET
+            ensembl_gene_id = COALESCE(EXCLUDED.ensembl_gene_id, genes.ensembl_gene_id),
+            gene_name = COALESCE(EXCLUDED.gene_name, genes.gene_name),
+            chromosome = COALESCE(EXCLUDED.chromosome, genes.chromosome),
+            start_position = COALESCE(EXCLUDED.start_position, genes.start_position),
+            end_position = COALESCE(EXCLUDED.end_position, genes.end_position),
+            strand = COALESCE(EXCLUDED.strand, genes.strand),
+            genome_build = COALESCE(EXCLUDED.genome_build, genes.genome_build)
+    """
+
+    if is_postgres(conn):
+        # PostgreSQL uses %s placeholders
+        pg_sql = upsert_sql.replace("?", "%s")
+        cur = conn.cursor()
+        for _, row in insert_df.iterrows():
+            cur.execute(pg_sql, tuple(row.get(c) for c in cols))
+        conn.commit()
+        cur.close()
+    else:
+        # DuckDB — batch via executemany
+        conn.executemany(
+            upsert_sql,
+            [tuple(row.get(c) for c in cols) for _, row in insert_df.iterrows()],
+        )
+
+    n = len(insert_df)
+    logger.info(f"Inserted/updated {n} genes in PEGASUS genes table")
 
 
 def _fetch_ensembl_genes(genes: list[str], ga_config: dict) -> pd.DataFrame:
@@ -80,6 +165,7 @@ def _fetch_ensembl_genes(genes: list[str], ga_config: dict) -> pd.DataFrame:
                     results.append({
                         "gene": symbol,
                         "ensembl_gene_id": info.get("id"),
+                        "gene_name": info.get("display_name"),
                         "chromosome": str(info.get("seq_region_name", "")),
                         "start_position": info.get("start"),
                         "end_position": info.get("end"),
@@ -114,6 +200,37 @@ def create_search_index(
         logger.warning("No searchable sources — skipping search index")
         return
 
+    # Determine gene reference table: prefer PEGASUS genes, fallback to gene_annotations
+    if _has_table(conn, "genes"):
+        gene_table = "genes"
+        gene_col = "gene_symbol"
+        dedup_cte = f"""
+        WITH deduplicated_genes AS (
+            SELECT
+                ensembl_gene_id,
+                {gene_col} AS gene,
+                chromosome,
+                start_position,
+                end_position
+            FROM {gene_table}
+            WHERE ensembl_gene_id IS NOT NULL
+        )"""
+    else:
+        gene_table = "gene_annotations"
+        gene_col = "gene"
+        dedup_cte = f"""
+        WITH deduplicated_genes AS (
+            SELECT
+                ensembl_gene_id,
+                MIN({gene_col}) AS gene,
+                MIN(chromosome) AS chromosome,
+                MIN(start_position) AS start_position,
+                MIN(end_position) AS end_position
+            FROM {gene_table}
+            WHERE ensembl_gene_id IS NOT NULL
+            GROUP BY ensembl_gene_id
+        )"""
+
     # Build SQL
     aliases = {s["name"]: f"t{i}" for i, s in enumerate(searchable)}
     join_clauses = []
@@ -122,7 +239,7 @@ def create_search_index(
 
     for s in searchable:
         alias = aliases[s["name"]]
-        table = s["name"]
+        table = raw_table_name(s["name"])
         join_clauses.append(f'LEFT JOIN "{table}" {alias} ON g.gene = {alias}.gene')
 
         # Display columns
@@ -158,17 +275,7 @@ def create_search_index(
     DROP TABLE IF EXISTS gene_search_index;
 
     CREATE TABLE gene_search_index AS
-    WITH deduplicated_genes AS (
-        SELECT
-            ensembl_gene_id,
-            MIN(gene) AS gene,
-            MIN(chromosome) AS chromosome,
-            MIN(start_position) AS start_position,
-            MIN(end_position) AS end_position
-        FROM gene_annotations
-        WHERE ensembl_gene_id IS NOT NULL
-        GROUP BY ensembl_gene_id
-    )
+    {dedup_cte}
     SELECT
         g.ensembl_gene_id,
         g.gene,
@@ -201,43 +308,6 @@ def create_search_index(
         conn.commit()
 
 
-def create_gene_table_summary(
-    conn: Any,
-    sources: list[dict],
-    loaded_tables: list[str],
-) -> None:
-    """Create gene_table_summary showing which genes appear in which tables."""
-    # Filter to sources with a gene column that were loaded
-    eligible = [
-        s for s in sources
-        if s.get("gene_column", "gene") and s["name"] in loaded_tables
-    ]
-
-    if not eligible:
-        logger.warning("No eligible sources — skipping gene table summary")
-        return
-
-    union_parts = []
-    for s in eligible:
-        table = s["name"]
-        display = s.get("display_name", table)
-        union_parts.append(
-            f"SELECT '{table}' AS table_name, '{display}' AS display_name, "
-            f"gene, COUNT(*) AS row_count "
-            f'FROM "{table}" WHERE gene IS NOT NULL GROUP BY gene'
-        )
-
-    union_sql = "\nUNION ALL\n".join(union_parts)
-
-    conn.execute("DROP TABLE IF EXISTS gene_table_summary")
-    conn.execute(f"CREATE TABLE gene_table_summary AS\n{union_sql}")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_gene_table_gene ON gene_table_summary(gene)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_gene_table_table ON gene_table_summary(table_name)")
-
-    if is_postgres(conn):
-        conn.commit()
-
-
 def create_pegasus_search_index(conn: Any) -> None:
     """Create gene_search_index from genes + evidence tables (PEGASUS mode).
 
@@ -250,11 +320,9 @@ def create_pegasus_search_index(conn: Any) -> None:
     CREATE TABLE gene_search_index AS
     WITH all_genes AS (
         SELECT DISTINCT gene_symbol FROM (
-            SELECT gene_symbol FROM locus_gene_evidence
+            SELECT gene_symbol FROM evidence
             UNION
-            SELECT gene_symbol FROM gene_evidence
-            UNION
-            SELECT gene_symbol FROM locus_gene_scores
+            SELECT gene_symbol FROM scored_evidence
         ) sub
     ),
     gene_info AS (
@@ -271,11 +339,7 @@ def create_pegasus_search_index(conn: Any) -> None:
         SELECT
             gene_symbol,
             STRING_AGG(DISTINCT evidence_category, ', ' ORDER BY evidence_category) AS evidence_categories
-        FROM (
-            SELECT gene_symbol, evidence_category FROM locus_gene_evidence
-            UNION ALL
-            SELECT gene_symbol, evidence_category FROM gene_evidence
-        ) sub
+        FROM evidence
         GROUP BY gene_symbol
     ),
     score_info AS (
@@ -284,7 +348,7 @@ def create_pegasus_search_index(conn: Any) -> None:
             MIN(integration_rank) AS best_rank,
             MAX(CASE WHEN is_predicted_effector THEN 1 ELSE 0 END) AS is_any_effector,
             COUNT(DISTINCT locus_id) AS n_loci
-        FROM locus_gene_scores
+        FROM scored_evidence
         GROUP BY gene_symbol
     )
     SELECT
@@ -324,42 +388,5 @@ def create_pegasus_search_index(conn: Any) -> None:
     logger.info("Created PEGASUS search index")
 
 
-def create_gene_evidence_summary(conn: Any) -> None:
-    """Create gene_evidence_summary showing which genes have which evidence types.
-
-    Replaces gene_table_summary for PEGASUS builds — summarizes from
-    evidence tables rather than raw source tables.
-    """
-    conn.execute("DROP TABLE IF EXISTS gene_evidence_summary")
-
-    sql = """
-    CREATE TABLE gene_evidence_summary AS
-    SELECT
-        gene_symbol,
-        evidence_category,
-        source_tag,
-        'locus' AS evidence_level,
-        COUNT(*) AS record_count
-    FROM locus_gene_evidence
-    GROUP BY gene_symbol, evidence_category, source_tag
-    UNION ALL
-    SELECT
-        gene_symbol,
-        evidence_category,
-        source_tag,
-        'gene' AS evidence_level,
-        COUNT(*) AS record_count
-    FROM gene_evidence
-    GROUP BY gene_symbol, evidence_category, source_tag
-    """
-
-    conn.execute(sql)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ges_gene ON gene_evidence_summary(gene_symbol)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ges_cat ON gene_evidence_summary(evidence_category)")
-
-    if is_postgres(conn):
-        conn.commit()
-
-    logger.info("Created gene evidence summary")
 
 

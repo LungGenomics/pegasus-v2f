@@ -50,7 +50,7 @@ def test_build_db_fails_on_nonempty(conn):
         "data_sources": [],
     }
     build_db(conn, config)
-    with pytest.raises(RuntimeError, match="already has tables"):
+    with pytest.raises(RuntimeError, match="database_not_empty"):
         build_db(conn, config)
 
 

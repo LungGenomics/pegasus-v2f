@@ -10,6 +10,11 @@ from typing import Any
 import duckdb
 
 
+def raw_table_name(source_name: str) -> str:
+    """Return the raw table name for a source (prefixed to distinguish from PEGASUS tables)."""
+    return f"raw_{source_name}"
+
+
 def get_connection(
     db: str | None = None,
     config: dict | None = None,
@@ -49,7 +54,7 @@ def get_connection(
         if read_only and not db_path.exists():
             raise FileNotFoundError(
                 f"Database not found: {db_path}\n"
-                "Run 'v2f add-source' or 'v2f build' first to create the database."
+                "Run 'v2f source add' or 'v2f build' first to create the database."
             )
         db_path.parent.mkdir(parents=True, exist_ok=True)
         return duckdb.connect(str(db_path), read_only=read_only)
@@ -59,7 +64,7 @@ def get_connection(
     if read_only and not db_path.exists():
         raise FileNotFoundError(
             f"Database not found: {db_path}\n"
-            "Run 'v2f add-source' or 'v2f build' first to create the database."
+            "Run 'v2f source add' or 'v2f build' first to create the database."
         )
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return duckdb.connect(str(db_path), read_only=read_only)

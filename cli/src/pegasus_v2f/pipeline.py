@@ -14,7 +14,7 @@ from pegasus_v2f.config import (
     get_data_sources,
     get_database_config,
 )
-from pegasus_v2f.db import is_postgres, write_table
+from pegasus_v2f.db import is_postgres, raw_table_name, write_table
 from pegasus_v2f.db_meta import write_build_meta
 from pegasus_v2f.db_schema import create_schema, has_tables, drop_all_tables
 from pegasus_v2f.loaders import load_source
@@ -22,9 +22,7 @@ from pegasus_v2f.transform import apply_transformations, clean_for_db
 from pegasus_v2f.annotate import (
     create_gene_annotations,
     create_search_index,
-    create_gene_table_summary,
     create_pegasus_search_index,
-    create_gene_evidence_summary,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,13 +51,14 @@ def build_db(
             logger.info("Overwrite mode — dropping all existing tables")
             drop_all_tables(conn)
         else:
-            raise RuntimeError(
-                "Database already has tables. Use --overwrite to rebuild, "
-                "or use add-source to append."
-            )
+            raise RuntimeError("database_not_empty")
 
     # Create core schema (+ PEGASUS tables if config has pegasus: section)
     create_schema(conn, config=config)
+
+    # Stash project_root in config for downstream consumers (e.g. cytoband cache)
+    if project_root:
+        config["_project_root"] = str(project_root)
 
     # Resolve data directory
     data_dir = None
@@ -95,21 +94,15 @@ def build_db(
 
     if is_pegasus:
         # Scoring
-        from pegasus_v2f.scoring import compute_locus_gene_scores
-        n_scored = compute_locus_gene_scores(conn, config)
+        from pegasus_v2f.scoring import materialize_scored_evidence
+        n_scored = materialize_scored_evidence(conn, config)
         logger.info(f"Scored {n_scored} locus-gene pairs")
 
         # PEGASUS search index (from evidence tables)
         create_pegasus_search_index(conn)
-
-        # Gene evidence summary
-        create_gene_evidence_summary(conn)
     else:
         # Legacy search index (from raw source tables)
         create_search_index(conn, sources, loaded_tables, config)
-
-        # Legacy gene table summary
-        create_gene_table_summary(conn, sources, loaded_tables)
 
     # Write build metadata
     db_config = get_database_config(config)
@@ -139,7 +132,7 @@ def process_data_sources_pegasus(
     Returns:
         (loaded_table_names, all_gene_symbols, metadata_rows_for_raw_only)
     """
-    from pegasus_v2f.evidence import route_evidence_source
+    from pegasus_v2f.evidence_loader import load_all_evidence
 
     loaded_tables = []
     all_genes: set[str] = set()
@@ -152,12 +145,12 @@ def process_data_sources_pegasus(
     raw_sources = []
 
     for source in sources:
-        evidence = source.get("evidence")
-        if not evidence:
+        blocks = source.get("evidence") or []
+        if not blocks:
             raw_sources.append(source)
-        elif evidence.get("role") == "locus_definition":
+        elif any(b.get("role") == "locus_definition" for b in blocks):
             locus_def_sources.append(source)
-        elif evidence.get("role") == "gwas_sumstats":
+        elif any(b.get("role") == "gwas_sumstats" for b in blocks):
             sumstats_sources.append(source)
         else:
             other_evidence_sources.append(source)
@@ -168,11 +161,12 @@ def process_data_sources_pegasus(
         logger.info(f"Pass 1a (locus_definition): {name}")
         try:
             df = _load_and_transform(source, data_dir)
-            result = route_evidence_source(conn, source, df, config)
-            loaded_tables.append(name)
-            all_genes.update(_collect_genes(df))
+            write_table(conn, raw_table_name(name), df)
+            result = load_all_evidence(conn, source, df)
             if result:
                 logger.info(f"  {result}")
+            loaded_tables.append(name)
+            all_genes.update(_collect_genes(df))
         except Exception as e:
             logger.error(f"  Failed: {e}")
 
@@ -182,11 +176,12 @@ def process_data_sources_pegasus(
         logger.info(f"Pass 1b (gwas_sumstats): {name}")
         try:
             df = _load_and_transform(source, data_dir)
-            result = route_evidence_source(conn, source, df, config)
-            loaded_tables.append(name)
-            all_genes.update(_collect_genes(df))
+            write_table(conn, raw_table_name(name), df)
+            result = load_all_evidence(conn, source, df)
             if result:
                 logger.info(f"  {result}")
+            loaded_tables.append(name)
+            all_genes.update(_collect_genes(df))
         except Exception as e:
             logger.error(f"  Failed: {e}")
 
@@ -196,11 +191,12 @@ def process_data_sources_pegasus(
         logger.info(f"Pass 2 (evidence): {name}")
         try:
             df = _load_and_transform(source, data_dir)
-            result = route_evidence_source(conn, source, df, config)
-            loaded_tables.append(name)
-            all_genes.update(_collect_genes(df))
+            write_table(conn, raw_table_name(name), df)
+            result = load_all_evidence(conn, source, df)
             if result:
                 logger.info(f"  {result}")
+            loaded_tables.append(name)
+            all_genes.update(_collect_genes(df))
         except Exception as e:
             logger.error(f"  Failed: {e}")
 
@@ -210,11 +206,11 @@ def process_data_sources_pegasus(
         logger.info(f"Pass 3 (raw): {name}")
         try:
             df = _load_and_transform(source, data_dir)
-            write_table(conn, name, df)
+            write_table(conn, raw_table_name(name), df)
             loaded_tables.append(name)
             all_genes.update(_collect_genes(df))
             metadata_rows.append({
-                "table_name": name,
+                "table_name": raw_table_name(name),
                 "display_name": source.get("display_name", name),
                 "description": source.get("description", ""),
                 "data_type": source.get("data_type", ""),
@@ -254,11 +250,11 @@ def process_data_sources(
 
             all_genes.update(_collect_genes(df))
 
-            write_table(conn, name, df)
+            write_table(conn, raw_table_name(name), df)
             loaded_tables.append(name)
 
             metadata_rows.append({
-                "table_name": name,
+                "table_name": raw_table_name(name),
                 "display_name": source.get("display_name", name),
                 "description": source.get("description", ""),
                 "data_type": source.get("data_type", ""),
@@ -289,9 +285,17 @@ def _load_and_transform(source: dict, data_dir: Path | None) -> pd.DataFrame:
 
 
 def _collect_genes(df: pd.DataFrame) -> set[str]:
-    """Extract unique gene symbols from a DataFrame."""
-    if "gene" in df.columns:
-        return {str(g) for g in df["gene"].dropna().unique() if g and str(g) != "nan"}
-    return set()
+    """Extract unique gene symbols from a DataFrame.
+
+    Checks both ``gene`` and ``gene_symbol`` columns so that sources
+    using either naming convention contribute to annotation lookup.
+    """
+    genes: set[str] = set()
+    for col in ("gene", "gene_symbol"):
+        if col in df.columns:
+            genes.update(
+                str(g) for g in df[col].dropna().unique() if g and str(g) != "nan"
+            )
+    return genes
 
 

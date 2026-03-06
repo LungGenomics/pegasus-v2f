@@ -19,16 +19,19 @@ def wizard_db():
     c = duckdb.connect(":memory:")
     create_pegasus_schema(c)
 
-    # Study + locus (needed for scoring after integration)
-    c.execute("INSERT INTO studies (study_id, trait) VALUES ('s1', 'HEIGHT')")
+    # Study + locus
+    c.execute(
+        "INSERT INTO studies (study_id, study_name, trait) VALUES ('s1', 'test', 'HEIGHT')"
+    )
     c.execute(
         "INSERT INTO loci (locus_id, study_id, chromosome, start_position, end_position, lead_pvalue) "
         "VALUES ('l1', 's1', '1', 900000, 1100000, 1e-10)"
     )
 
-    # Raw table simulating a gene-level annotation
+    # Raw table simulating a gene-level annotation (prefixed with raw_)
+    from pegasus_v2f.db import raw_table_name
     c.execute(
-        "CREATE TABLE secretome AS SELECT * FROM (VALUES "
+        f"CREATE TABLE \"{raw_table_name('secretome')}\" AS SELECT * FROM (VALUES "
         "('GENE_A', 'Secreted', 0.95), "
         "('GENE_B', 'Membrane', 0.80) "
         ") t(gene, location, confidence)"
@@ -149,37 +152,25 @@ class TestValidateMapping:
 
 
 class TestApplyIntegration:
-    def test_loads_evidence_and_drops_raw(self, wizard_db):
+    def test_loads_evidence(self, wizard_db):
         config = {
             "pegasus": {
                 "study": {"id_prefix": "test", "traits": ["HEIGHT"]},
-                "integration": {"method": "criteria_count_v1", "effector_threshold": 0.25, "criteria": []},
             },
             "data_sources": [{"name": "secretome", "source_type": "memory"}],
         }
-        mapping = {
+        mappings = [{
             "category": "KNOW",
-            "centric": "gene",
             "source_tag": "hpa_secretome",
             "fields": {"gene": "gene"},
-        }
-        result = apply_integration(wizard_db, "secretome", mapping, config)
+        }]
+        result = apply_integration(wizard_db, "secretome", mappings, config)
 
-        # Evidence was loaded
+        # Evidence was loaded into the unified evidence table
         rows = wizard_db.execute(
-            "SELECT * FROM gene_evidence WHERE source_tag = 'hpa_secretome'"
+            "SELECT * FROM evidence WHERE source_tag = 'hpa_secretome'"
         ).fetchall()
         assert len(rows) == 2
-
-        # Raw table was dropped
-        tables = [r[0] for r in wizard_db.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
-        ).fetchall()]
-        assert "secretome" not in tables
-
-        # Scoring ran (0 because gene_evidence alone doesn't create locus-gene candidates)
-        assert result["scores_computed"] >= 0
-        assert result["raw_table_dropped"] is True
 
 
 class TestUpdateYaml:
@@ -195,17 +186,17 @@ class TestUpdateYaml:
             "    source_type: file\n"
         )
 
-        evidence_block = {
+        evidence_blocks = [{
             "category": "KNOW",
             "centric": "gene",
             "source_tag": "hpa",
             "fields": {"gene": "gene"},
-        }
-        _update_yaml_evidence_block(config_file, "secretome", evidence_block)
+        }]
+        _update_yaml_evidence_block(config_file, "secretome", evidence_blocks)
 
         text = config_file.read_text()
         assert "evidence:" in text
-        assert "category: KNOW" in text
+        assert "- category: KNOW" in text
         assert "centric: gene" in text
         assert "source_tag: hpa" in text
 
@@ -222,14 +213,47 @@ class TestUpdateYaml:
             "    source_type: file\n"
         )
 
-        evidence_block = {
+        evidence_blocks = [{
             "category": "GWAS",
             "centric": "gene",
             "source_tag": "gwas1",
             "fields": {"gene": "gene_symbol"},
-        }
-        _update_yaml_evidence_block(config_file, "my_source", evidence_block)
+        }]
+        _update_yaml_evidence_block(config_file, "my_source", evidence_blocks)
 
         text = config_file.read_text()
         assert "# Important comment" in text
         assert "version: 1" in text
+
+    def test_multi_evidence_blocks(self, tmp_path):
+        config_file = tmp_path / "v2f.yaml"
+        config_file.write_text(
+            "version: 1\n"
+            "data_sources:\n"
+            "  - name: multi_source\n"
+            "    source_type: googlesheets\n"
+            "    url: https://example.com\n"
+        )
+
+        evidence_blocks = [
+            {
+                "category": "QTL",
+                "centric": "gene",
+                "source_tag": "multi_grex",
+                "fields": {"gene": "Gene", "score": "GREx"},
+            },
+            {
+                "category": "GWAS",
+                "centric": "gene",
+                "source_tag": "multi_cod",
+                "fields": {"gene": "Gene", "pvalue": "Cod."},
+            },
+        ]
+        _update_yaml_evidence_block(config_file, "multi_source", evidence_blocks)
+
+        text = config_file.read_text()
+        assert "evidence:" in text
+        assert "- category: QTL" in text
+        assert "source_tag: multi_grex" in text
+        assert "- category: GWAS" in text
+        assert "source_tag: multi_cod" in text

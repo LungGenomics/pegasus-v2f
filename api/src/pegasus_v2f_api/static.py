@@ -19,8 +19,10 @@ def mount_static(app: FastAPI) -> None:
     dist_dir = _find_ui_dist()
 
     if dist_dir and dist_dir.exists():
-        # Serve static assets (js, css, images)
-        app.mount("/assets", StaticFiles(directory=dist_dir / "assets"), name="assets")
+        # Serve static assets at /ui/assets/ (matching Vite base: '/ui/')
+        app.mount(
+            "/ui/assets", StaticFiles(directory=dist_dir / "assets"), name="ui-assets"
+        )
 
         @app.get("/ui/{path:path}")
         async def spa_route(path: str):

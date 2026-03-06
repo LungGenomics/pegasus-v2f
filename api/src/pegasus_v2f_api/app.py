@@ -30,7 +30,7 @@ def create_app(
 
         db_arg = state["db"] or os.environ.get("V2F_DATABASE_URL")
         state["conn"] = get_connection(
-            db=db_arg, config=state["config"], read_only=True,
+            db=db_arg, config=state["config"], read_only=False,
             project_root=state["project_root"],
         )
         app.state.conn = state["conn"]
@@ -52,8 +52,17 @@ def create_app(
         allow_headers=["*"],
     )
 
-    from pegasus_v2f_api.routes import router
-    app.include_router(router, prefix="/api")
+    from pegasus_v2f_api.routes.genes import router as genes_router
+    from pegasus_v2f_api.routes.studies import router as studies_router
+    from pegasus_v2f_api.routes.sources import router as sources_router
+    from pegasus_v2f_api.routes.exports import router as exports_router
+    from pegasus_v2f_api.routes.db import router as db_router
+
+    app.include_router(genes_router, prefix="/api")
+    app.include_router(studies_router, prefix="/api")
+    app.include_router(sources_router, prefix="/api")
+    app.include_router(exports_router, prefix="/api")
+    app.include_router(db_router, prefix="/api")
 
     from pegasus_v2f_api.static import mount_static
     mount_static(app)

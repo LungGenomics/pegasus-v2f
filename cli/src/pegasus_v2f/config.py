@@ -177,7 +177,11 @@ def update_study_in_yaml(
     config_path: Path, id_prefix: str, key: str, value: Any
 ) -> None:
     """Update a scalar field on a study. Raises ValueError on bad key or missing study."""
-    allowed_keys = {"gwas_source", "ancestry", "genome_build"}
+    allowed_keys = {
+        "gwas_source", "ancestry", "genome_build",
+        "study_description", "trait_descriptions", "trait_ontology_ids",
+        "sample_size", "doi", "year",
+    }
     if key == "id_prefix":
         raise ValueError("id_prefix is immutable — cannot be changed after creation")
     if key not in allowed_keys:

@@ -22,8 +22,8 @@ class TestValidatePegasusConfig:
         config = {
             "pegasus": {"study": [{"traits": ["HEIGHT"]}]},
             "data_sources": [
-                {"name": "s", "evidence": {"role": "locus_definition", "source_tag": "x",
-                 "fields": {"gene": "g", "trait": "t", "chromosome": "c", "position": "p"}}}
+                {"name": "s", "evidence": [{"role": "locus_definition", "source_tag": "x",
+                 "fields": {"gene": "g", "trait": "t", "chromosome": "c", "position": "p"}}]}
             ],
         }
         errors = validate_pegasus_config(config)
@@ -33,8 +33,8 @@ class TestValidatePegasusConfig:
         config = {
             "pegasus": {"study": [{"id_prefix": "test"}]},
             "data_sources": [
-                {"name": "s", "evidence": {"role": "locus_definition", "source_tag": "x",
-                 "fields": {"gene": "g", "trait": "t", "chromosome": "c", "position": "p"}}}
+                {"name": "s", "evidence": [{"role": "locus_definition", "source_tag": "x",
+                 "fields": {"gene": "g", "trait": "t", "chromosome": "c", "position": "p"}}]}
             ],
         }
         errors = validate_pegasus_config(config)
@@ -44,8 +44,8 @@ class TestValidatePegasusConfig:
         config = {
             "pegasus": {"study": [{"id_prefix": "test", "traits": []}]},
             "data_sources": [
-                {"name": "s", "evidence": {"role": "locus_definition", "source_tag": "x",
-                 "fields": {"gene": "g", "trait": "t", "chromosome": "c", "position": "p"}}}
+                {"name": "s", "evidence": [{"role": "locus_definition", "source_tag": "x",
+                 "fields": {"gene": "g", "trait": "t", "chromosome": "c", "position": "p"}}]}
             ],
         }
         errors = validate_pegasus_config(config)
@@ -56,8 +56,8 @@ class TestValidatePegasusConfig:
         config = {
             "pegasus": {"study": [{"id_prefix": "test", "traits": ["HEIGHT"]}]},
             "data_sources": [
-                {"name": "s", "evidence": {"centric": "gene", "category": "KNOW",
-                 "source_tag": "x", "fields": {"gene": "g"}}}
+                {"name": "s", "evidence": [{"centric": "gene", "category": "KNOW",
+                 "source_tag": "x", "fields": {"gene": "g"}}]}
             ],
         }
         errors = validate_pegasus_config(config)
@@ -67,8 +67,8 @@ class TestValidatePegasusConfig:
         config = {
             "pegasus": {"study": [{"id_prefix": "test", "traits": ["HEIGHT"]}]},
             "data_sources": [
-                {"name": "s", "evidence": {"role": "locus_definition", "source_tag": "x",
-                 "fields": {"gene": "g", "trait": "t", "chromosome": "c", "position": "p"}}}
+                {"name": "s", "evidence": [{"role": "locus_definition", "source_tag": "x",
+                 "fields": {"gene": "g", "trait": "t", "chromosome": "c", "position": "p"}}]}
             ],
         }
         errors = validate_pegasus_config(config)
@@ -78,9 +78,9 @@ class TestValidatePegasusConfig:
         config = {
             "pegasus": {"study": [{"id_prefix": "test", "traits": ["HEIGHT"]}]},
             "data_sources": [
-                {"name": "ss", "evidence": {"role": "gwas_sumstats", "source_tag": "x",
+                {"name": "ss", "evidence": [{"role": "gwas_sumstats", "source_tag": "x",
                  "trait": "HEIGHT",
-                 "fields": {"chromosome": "c", "position": "p", "pvalue": "pv"}}}
+                 "fields": {"chromosome": "c", "position": "p", "pvalue": "pv"}}]}
             ],
         }
         errors = validate_pegasus_config(config)
@@ -93,8 +93,8 @@ class TestValidatePegasusConfig:
                 "integration": {"method": "unknown_method"},
             },
             "data_sources": [
-                {"name": "s", "evidence": {"role": "locus_definition", "source_tag": "x",
-                 "fields": {"gene": "g", "trait": "t", "chromosome": "c", "position": "p"}}}
+                {"name": "s", "evidence": [{"role": "locus_definition", "source_tag": "x",
+                 "fields": {"gene": "g", "trait": "t", "chromosome": "c", "position": "p"}}]}
             ],
         }
         errors = validate_pegasus_config(config)
@@ -106,15 +106,15 @@ class TestValidateEvidenceConfig:
         assert validate_evidence_config({"name": "raw_source"}) == []
 
     def test_invalid_role(self):
-        source = {"name": "s", "evidence": {"role": "invalid_role"}}
+        source = {"name": "s", "evidence": [{"role": "invalid_role"}]}
         errors = validate_evidence_config(source)
         assert any("not valid" in e for e in errors)
 
     def test_role_missing_source_tag(self):
         source = {
             "name": "s",
-            "evidence": {"role": "locus_definition",
-                         "fields": {"gene": "g", "trait": "t", "chromosome": "c", "position": "p"}},
+            "evidence": [{"role": "locus_definition",
+                         "fields": {"gene": "g", "trait": "t", "chromosome": "c", "position": "p"}}],
         }
         errors = validate_evidence_config(source)
         assert any("source_tag" in e for e in errors)
@@ -122,7 +122,7 @@ class TestValidateEvidenceConfig:
     def test_role_missing_fields(self):
         source = {
             "name": "s",
-            "evidence": {"role": "locus_definition", "source_tag": "x", "fields": {"gene": "g"}},
+            "evidence": [{"role": "locus_definition", "source_tag": "x", "fields": {"gene": "g"}}],
         }
         errors = validate_evidence_config(source)
         assert any("missing required mappings" in e for e in errors)
@@ -130,78 +130,95 @@ class TestValidateEvidenceConfig:
     def test_valid_locus_definition(self):
         source = {
             "name": "s",
-            "evidence": {
+            "evidence": [{
                 "role": "locus_definition",
                 "source_tag": "x",
                 "fields": {"gene": "g", "trait": "t", "chromosome": "c", "position": "p"},
-            },
+            }],
         }
         assert validate_evidence_config(source) == []
 
     def test_valid_gwas_sumstats(self):
         source = {
             "name": "ss",
-            "evidence": {
+            "evidence": [{
                 "role": "gwas_sumstats",
                 "source_tag": "x",
                 "pvalue_threshold": 5e-8,
                 "fields": {"chromosome": "c", "position": "p", "pvalue": "pv"},
-            },
+            }],
         }
         assert validate_evidence_config(source) == []
 
     def test_invalid_pvalue_threshold(self):
         source = {
             "name": "ss",
-            "evidence": {
+            "evidence": [{
                 "role": "gwas_sumstats",
                 "source_tag": "x",
                 "pvalue_threshold": "not_a_number",
                 "fields": {"chromosome": "c", "position": "p", "pvalue": "pv"},
-            },
+            }],
         }
         errors = validate_evidence_config(source)
         assert any("pvalue_threshold" in e for e in errors)
 
     def test_invalid_centric(self):
-        source = {"name": "s", "evidence": {"centric": "invalid", "category": "QTL", "source_tag": "x"}}
+        source = {"name": "s", "evidence": [{"centric": "invalid", "category": "QTL", "source_tag": "x"}]}
         errors = validate_evidence_config(source)
         assert any("not valid" in e for e in errors)
 
     def test_centric_missing_category(self):
-        source = {"name": "s", "evidence": {"centric": "gene", "source_tag": "x", "fields": {"gene": "g"}}}
+        source = {"name": "s", "evidence": [{"centric": "gene", "source_tag": "x", "fields": {"gene": "g"}}]}
         errors = validate_evidence_config(source)
         assert any("category is required" in e for e in errors)
 
     def test_invalid_category(self):
         source = {
             "name": "s",
-            "evidence": {"centric": "gene", "category": "INVALID_CAT", "source_tag": "x",
-                         "fields": {"gene": "g"}},
+            "evidence": [{"centric": "gene", "category": "INVALID_CAT", "source_tag": "x",
+                         "fields": {"gene": "g"}}],
         }
         errors = validate_evidence_config(source)
         assert any("not a valid PEGASUS category" in e for e in errors)
 
     def test_neither_role_nor_centric(self):
-        source = {"name": "s", "evidence": {"source_tag": "x"}}
+        source = {"name": "s", "evidence": [{"source_tag": "x"}]}
         errors = validate_evidence_config(source)
         assert any("role" in e and "centric" in e for e in errors)
 
     def test_valid_gene_centric(self):
         source = {
             "name": "s",
-            "evidence": {"centric": "gene", "category": "KNOW", "source_tag": "x",
-                         "evidence_type": "secretome", "fields": {"gene": "g"}},
+            "evidence": [{"centric": "gene", "category": "KNOW", "source_tag": "x",
+                         "evidence_type": "secretome", "fields": {"gene": "g"}}],
         }
         assert validate_evidence_config(source) == []
 
     def test_valid_variant_centric(self):
         source = {
             "name": "s",
-            "evidence": {"centric": "variant", "category": "COLOC", "source_tag": "x",
-                         "fields": {"gene": "g"}},
+            "evidence": [{"centric": "variant", "category": "COLOC", "source_tag": "x",
+                         "fields": {"gene": "g"}}],
         }
         assert validate_evidence_config(source) == []
+
+    def test_evidence_must_be_list(self):
+        source = {"name": "s", "evidence": {"role": "locus_definition"}}
+        errors = validate_evidence_config(source)
+        assert any("must be a list" in e for e in errors)
+
+    def test_multi_block_validates_all(self):
+        source = {
+            "name": "s",
+            "evidence": [
+                {"centric": "gene", "category": "QTL", "source_tag": "a", "fields": {"gene": "g"}},
+                {"centric": "gene", "source_tag": "b", "fields": {"gene": "g"}},  # missing category
+            ],
+        }
+        errors = validate_evidence_config(source)
+        assert len(errors) == 1
+        assert "category is required" in errors[0]
 
 
 class TestResolveEvidenceMapping:
@@ -240,7 +257,7 @@ class TestConfigIntegration:
             "pegasus": {"study": [{"id_prefix": "test", "traits": ["H"]}]},
             "data_sources": [
                 {"name": "s", "source_type": "file",
-                 "evidence": {"role": "invalid_role"}},
+                 "evidence": [{"role": "invalid_role"}]},
             ],
         }
         errors = validate_config(config)

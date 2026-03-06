@@ -17,7 +17,7 @@ EVIDENCE_CENTRICS = {"gene", "variant"}
 # Required field mappings per role / centric
 # Note: locus_definition "trait" requirement is conditional — see validate_evidence_config
 REQUIRED_FIELDS = {
-    "locus_definition": {"gene", "chromosome", "position"},
+    "locus_definition": {"chromosome", "position"},  # gene is optional
     "gwas_sumstats": {"chromosome", "position", "pvalue"},
     "gene": {"gene"},
     "variant": {"gene"},
@@ -66,8 +66,9 @@ def validate_pegasus_config(config: dict) -> list[str]:
     # Check that at least one locus source exists
     sources = config.get("data_sources", [])
     has_locus_source = any(
-        s.get("evidence", {}).get("role") in EVIDENCE_ROLES
+        block.get("role") in EVIDENCE_ROLES
         for s in sources
+        for block in (s.get("evidence") or [])
     )
     if not has_locus_source:
         errors.append(
@@ -79,53 +80,55 @@ def validate_pegasus_config(config: dict) -> list[str]:
     # Cross-validate evidence.study and evidence.trait references
     multiple_studies = len(studies) > 1
     for src in sources:
-        evidence = src.get("evidence")
-        if not evidence:
+        blocks = src.get("evidence") or []
+        if not blocks:
             continue
         name = src.get("name", "<unnamed>")
-        role = evidence.get("role")
 
-        # evidence.study cross-validation
-        ev_study = evidence.get("study")
-        if ev_study:
-            if ev_study not in seen_prefixes:
-                errors.append(
-                    f"source '{name}': evidence.study '{ev_study}' "
-                    f"does not match any configured study id_prefix"
-                )
-        elif role in EVIDENCE_ROLES and multiple_studies:
-            errors.append(
-                f"source '{name}': evidence.study is required when multiple "
-                f"studies are configured (has role '{role}')"
-            )
+        for evidence in blocks:
+            role = evidence.get("role")
 
-        # evidence.trait cross-validation
-        ev_trait = evidence.get("trait")
-        if ev_trait:
-            # Determine which study this source belongs to
-            ref_study = ev_study or (studies[0].get("id_prefix") if len(studies) == 1 else None)
-            if ref_study and ref_study in all_traits_by_study:
-                if ev_trait not in all_traits_by_study[ref_study]:
+            # evidence.study cross-validation
+            ev_study = evidence.get("study")
+            if ev_study:
+                if ev_study not in seen_prefixes:
                     errors.append(
-                        f"source '{name}': evidence.trait '{ev_trait}' "
-                        f"is not in study '{ref_study}' traits list"
+                        f"source '{name}': evidence.study '{ev_study}' "
+                        f"does not match any configured study id_prefix"
                     )
-
-        # gwas_sumstats requires evidence.trait
-        if role == "gwas_sumstats" and not ev_trait:
-            errors.append(
-                f"source '{name}': evidence.trait is required for gwas_sumstats "
-                f"(summary statistics are per-trait)"
-            )
-
-        # locus_definition without evidence.trait must have fields.trait mapping
-        if role == "locus_definition" and not ev_trait:
-            fields = evidence.get("fields", {})
-            if "trait" not in fields:
+            elif role in EVIDENCE_ROLES and multiple_studies:
                 errors.append(
-                    f"source '{name}': locus_definition without evidence.trait "
-                    f"must have fields.trait mapping (trait from data column)"
+                    f"source '{name}': evidence.study is required when multiple "
+                    f"studies are configured (has role '{role}')"
                 )
+
+            # evidence.trait cross-validation
+            ev_trait = evidence.get("trait")
+            if ev_trait:
+                # Determine which study this source belongs to
+                ref_study = ev_study or (studies[0].get("id_prefix") if len(studies) == 1 else None)
+                if ref_study and ref_study in all_traits_by_study:
+                    if ev_trait not in all_traits_by_study[ref_study]:
+                        errors.append(
+                            f"source '{name}': evidence.trait '{ev_trait}' "
+                            f"is not in study '{ref_study}' traits list"
+                        )
+
+            # gwas_sumstats requires evidence.trait
+            if role == "gwas_sumstats" and not ev_trait:
+                errors.append(
+                    f"source '{name}': evidence.trait is required for gwas_sumstats "
+                    f"(summary statistics are per-trait)"
+                )
+
+            # locus_definition without evidence.trait must have fields.trait mapping
+            if role == "locus_definition" and not ev_trait:
+                fields = evidence.get("fields", {})
+                if "trait" not in fields:
+                    errors.append(
+                        f"source '{name}': locus_definition without evidence.trait "
+                        f"must have fields.trait mapping (trait from data column)"
+                    )
 
     # Integration config (optional but validated if present)
     integration = pegasus.get("integration")
@@ -141,16 +144,32 @@ def validate_pegasus_config(config: dict) -> list[str]:
 
 
 def validate_evidence_config(source: dict) -> list[str]:
-    """Validate the evidence: block of a single data source.
+    """Validate the evidence: block(s) of a single data source.
 
-    Returns list of error messages (empty = valid).
+    Evidence is always a list of dicts. Returns list of error messages (empty = valid).
     """
     errors = []
     evidence = source.get("evidence")
     if not evidence:
         return errors  # No evidence block — raw source, skip
 
+    if not isinstance(evidence, list):
+        errors.append(
+            f"source '{source.get('name', '<unnamed>')}': evidence must be a list of dicts"
+        )
+        return errors
+
+    for i, block in enumerate(evidence):
+        errors.extend(_validate_evidence_block(source, block, i))
+
+    return errors
+
+
+def _validate_evidence_block(source: dict, evidence: dict, index: int = 0) -> list[str]:
+    """Validate a single evidence block within a source's evidence list."""
+    errors = []
     name = source.get("name", "<unnamed>")
+    label = f"source '{name}' evidence[{index}]"
     role = evidence.get("role")
     centric = evidence.get("centric")
 
@@ -158,13 +177,13 @@ def validate_evidence_config(source: dict) -> list[str]:
     if role:
         if role not in EVIDENCE_ROLES:
             errors.append(
-                f"source '{name}': evidence.role '{role}' is not valid "
+                f"{label}: evidence.role '{role}' is not valid "
                 f"(must be one of: {', '.join(sorted(EVIDENCE_ROLES))})"
             )
 
         # source_tag required for roles
         if "source_tag" not in evidence:
-            errors.append(f"source '{name}': evidence.source_tag is required for role sources")
+            errors.append(f"{label}: evidence.source_tag is required for role sources")
 
         # Validate sumstats-specific fields
         if role == "gwas_sumstats":
@@ -174,31 +193,31 @@ def validate_evidence_config(source: dict) -> list[str]:
                     float(pval)
                 except (TypeError, ValueError):
                     errors.append(
-                        f"source '{name}': evidence.pvalue_threshold must be numeric"
+                        f"{label}: evidence.pvalue_threshold must be numeric"
                     )
 
     elif centric:
         if centric not in EVIDENCE_CENTRICS:
             errors.append(
-                f"source '{name}': evidence.centric '{centric}' is not valid "
+                f"{label}: evidence.centric '{centric}' is not valid "
                 f"(must be one of: {', '.join(sorted(EVIDENCE_CENTRICS))})"
             )
 
         category = evidence.get("category")
         if not category:
-            errors.append(f"source '{name}': evidence.category is required for centric sources")
+            errors.append(f"{label}: evidence.category is required for centric sources")
         elif category not in EVIDENCE_CATEGORIES:
             errors.append(
-                f"source '{name}': evidence.category '{category}' is not a valid "
+                f"{label}: evidence.category '{category}' is not a valid "
                 f"PEGASUS category (valid: {', '.join(sorted(EVIDENCE_CATEGORIES))})"
             )
 
         if "source_tag" not in evidence:
-            errors.append(f"source '{name}': evidence.source_tag is required")
+            errors.append(f"{label}: evidence.source_tag is required")
 
     else:
         errors.append(
-            f"source '{name}': evidence block must have either 'role' or 'centric' "
+            f"{label}: evidence block must have either 'role' or 'centric' "
             f"(with 'category')"
         )
 
@@ -212,14 +231,14 @@ def validate_evidence_config(source: dict) -> list[str]:
         missing = required - set(fields.keys())
         if missing:
             errors.append(
-                f"source '{name}': evidence.fields missing required mappings "
+                f"{label}: evidence.fields missing required mappings "
                 f"for role '{role}': {', '.join(sorted(missing))}"
             )
     elif centric and centric in REQUIRED_FIELDS:
         missing = REQUIRED_FIELDS[centric] - set(fields.keys())
         if missing:
             errors.append(
-                f"source '{name}': evidence.fields missing required mappings "
+                f"{label}: evidence.fields missing required mappings "
                 f"for centric '{centric}': {', '.join(sorted(missing))}"
             )
 

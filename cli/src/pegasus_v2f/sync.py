@@ -20,9 +20,15 @@ def sync_status(project_root: Path) -> dict:
     if not (project_root / ".git").exists():
         return {"is_git": False}
 
+    try:
+        branch = _git(project_root, "rev-parse", "--abbrev-ref", "HEAD")
+    except RuntimeError:
+        # No commits yet (fresh git init)
+        branch = None
+
     result = {
         "is_git": True,
-        "branch": _git(project_root, "rev-parse", "--abbrev-ref", "HEAD"),
+        "branch": branch,
         "ahead": 0,
         "behind": 0,
         "dirty": False,
