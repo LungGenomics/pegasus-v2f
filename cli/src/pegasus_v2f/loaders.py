@@ -8,17 +8,24 @@ from pathlib import Path
 
 import pandas as pd
 
+from pegasus_v2f.report import Report
+
 # Simple in-memory cache for XLSX downloads (avoids double-download during
 # preview → load flow within a single CLI invocation).
 _xlsx_cache: dict[str, bytes] = {}
 
 
-def load_source(source: dict, data_dir: Path | None = None) -> pd.DataFrame:
+def load_source(
+    source: dict,
+    data_dir: Path | None = None,
+    report: Report | None = None,
+) -> pd.DataFrame:
     """Load a data source based on its source_type config.
 
     Args:
         source: Source config dict with at least 'source_type' and 'name'.
         data_dir: Base directory for resolving relative file paths (e.g., project_root/data/raw/).
+        report: Optional report to record loading details.
     """
     source_type = source["source_type"]
 
@@ -35,8 +42,19 @@ def load_source(source: dict, data_dir: Path | None = None) -> pd.DataFrame:
 
     # Rename gene column if specified
     gene_col = source.get("gene_column")
-    if gene_col and gene_col != "gene" and gene_col in df.columns:
-        df = df.rename(columns={gene_col: "gene"})
+    if gene_col and gene_col != "gene":
+        if gene_col in df.columns:
+            df = df.rename(columns={gene_col: "gene"})
+        elif report:
+            report.warning(
+                "gene_column_missing",
+                f"gene_column '{gene_col}' not found in source columns: {', '.join(df.columns[:10])}",
+            )
+
+    if report:
+        report.info("loaded", f"{source_type}: {len(df)} rows, {len(df.columns)} columns")
+        report.counters["rows_loaded"] = len(df)
+        report.counters["columns"] = len(df.columns)
 
     return df
 

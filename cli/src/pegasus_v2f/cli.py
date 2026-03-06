@@ -323,6 +323,9 @@ def rebuild(ctx):
 
     config = read_config(root)
 
+    from pegasus_v2f.report import Report, render_report
+    report = Report(operation="rebuild")
+
     conn = get_connection(db=db_arg, config=config, project_root=root)
     try:
         if has_tables(conn):
@@ -348,6 +351,7 @@ def rebuild(ctx):
 
             from pegasus_v2f.study_management import add_study as _add_study
 
+            study_report = report.child(f"study:{study_name}")
             result = _add_study(
                 conn,
                 study_name=study_name,
@@ -372,6 +376,7 @@ def rebuild(ctx):
                 merge_distance_kb=locus_def.get("merge_distance_kb", 250),
                 cache_dir=root / ".v2f",
                 config_path=None,  # Don't re-write yaml during rebuild
+                report=study_report,
             )
             total_loci += result["n_loci"]
             click.echo(f"  Study '{study_name}': {result['n_loci']} loci from {result['n_sentinels']} sentinels")
@@ -387,11 +392,14 @@ def rebuild(ctx):
             name = source_def["name"]
             try:
                 from pegasus_v2f import sources as src_mod
-                rows = src_mod.add_source(conn, source_def, data_dir=data_dir, config=config, no_score=True)
+                source_report = report.child(f"source:{name}")
+                rows = src_mod.add_source(conn, source_def, data_dir=data_dir, config=config,
+                                          no_score=True, report=source_report)
                 total_sources += 1
                 click.echo(f"  Source '{name}': {rows} rows")
             except Exception as e:
                 click.echo(f"  Source '{name}' failed: {e}", err=True)
+                report.error("source_failed", f"{name}: {e}")
 
         # --- Gene annotations ---
         from pegasus_v2f.annotate import create_gene_annotations, create_pegasus_search_index
@@ -399,12 +407,14 @@ def rebuild(ctx):
         gene_rows = conn.execute("SELECT DISTINCT gene_symbol FROM evidence").fetchall()
         all_genes = [r[0] for r in gene_rows if r[0]]
         if all_genes:
-            create_gene_annotations(conn, all_genes, config)
+            annotate_report = report.child("annotate")
+            create_gene_annotations(conn, all_genes, config, report=annotate_report)
             click.echo(f"  Annotated {len(all_genes)} genes")
 
         # --- Score ---
         from pegasus_v2f.scoring import materialize_scored_evidence
-        n_scored = materialize_scored_evidence(conn, config)
+        score_report = report.child("scoring")
+        n_scored = materialize_scored_evidence(conn, config, report=score_report)
         click.echo(f"  Scored {n_scored} locus-gene pairs")
 
         # --- Search index ---
@@ -417,6 +427,10 @@ def rebuild(ctx):
         write_build_meta(conn, config_to_yaml(config), genome_build=db_config.get("genome_build", "hg38"))
 
         click.echo(f"\nRebuilt: {len(studies)} studies, {total_loci} loci, {total_sources} sources, {n_scored} scored pairs")
+        if ctx.obj.get("json_output"):
+            render_report(report, json_mode=True)
+        elif report.has_warnings:
+            render_report(report)
 
     finally:
         conn.close()
@@ -444,10 +458,17 @@ def rescore(ctx):
     if not config or not config.get("pegasus"):
         raise click.ClickException("No pegasus config found — rescore requires a PEGASUS build")
 
+    from pegasus_v2f.report import Report, render_report
+    report = Report(operation="rescore")
+
     with open_db(db=db_arg, config=config, project_root=root) as conn:
-        n = materialize_scored_evidence(conn, config)
+        n = materialize_scored_evidence(conn, config, report=report)
 
     click.echo(f"Scored {n} locus-gene pairs")
+    if ctx.obj.get("json_output"):
+        render_report(report, json_mode=True)
+    elif report.has_warnings:
+        render_report(report)
 
 
 # =====================================================================
@@ -892,6 +913,10 @@ def source_add(ctx, name, source_type, url, file_path, sheet, skip_rows, gene_co
         if ev_blocks:
             source_def["evidence"] = ev_blocks
 
+    from pegasus_v2f.report import Report, render_report
+
+    report = Report(operation="source_add")
+
     try:
         with open_db(db=db_arg, config=config, project_root=root) as conn:
             if force:
@@ -899,7 +924,8 @@ def source_add(ctx, name, source_type, url, file_path, sheet, skip_rows, gene_co
                     src_mod.remove_source(conn, name, config=config)
                 except ValueError:
                     pass  # Source didn't exist, that's fine
-            rows = src_mod.add_source(conn, source_def, data_dir=data_dir, config=config, no_score=no_score)
+            rows = src_mod.add_source(conn, source_def, data_dir=data_dir, config=config,
+                                      no_score=no_score, report=report)
     except (ValueError, FileNotFoundError) as e:
         raise click.ClickException(str(e))
 
@@ -913,6 +939,10 @@ def source_add(ctx, name, source_type, url, file_path, sheet, skip_rows, gene_co
             append_source_to_yaml(config_path, source_def)
 
     click.echo(f"Added source '{name}': {rows} rows")
+    if ctx.obj.get("json_output"):
+        render_report(report, json_mode=True)
+    elif report.has_warnings:
+        render_report(report)
 
 
 @source.command("show")
@@ -1547,6 +1577,9 @@ def study_add(ctx, study_name, loci_file, loci_sheet, loci_skip, gene_column,
     # If loci provided, create studies and loci in DB
     if loci_file:
         from pegasus_v2f.study_management import add_study as _add_study
+        from pegasus_v2f.report import Report, render_report
+
+        report = Report(operation="study_add")
 
         conn = get_connection(db=db_arg, config=config, project_root=root)
         try:
@@ -1575,11 +1608,16 @@ def study_add(ctx, study_name, loci_file, loci_sheet, loci_skip, gene_column,
                 merge_distance_kb=merge_kb,
                 cache_dir=root / ".v2f",
                 config_path=config_path,
+                report=report,
             )
             click.echo(
                 f"Added study '{study_name}' with {len(traits)} trait(s): "
                 f"{result['n_loci']} loci from {result['n_sentinels']} sentinels"
             )
+            if ctx.obj.get("json_output"):
+                render_report(report, json_mode=True)
+            elif report.has_warnings:
+                render_report(report)
         finally:
             conn.close()
     else:

@@ -9,6 +9,7 @@ from typing import Any
 import pandas as pd
 
 from pegasus_v2f.db import is_postgres, write_table
+from pegasus_v2f.report import Report
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ def add_study(
     merge_distance_kb: int = DEFAULT_MERGE_DISTANCE_KB,
     cache_dir: Path | None = None,
     config_path: Path | None = None,
+    report: Report | None = None,
 ) -> dict:
     """Add a study with loci from a sentinel variant file.
 
@@ -128,8 +130,20 @@ def add_study(
 
     # Ensure chromosome is string, position is int
     loci_df["chromosome"] = loci_df["chromosome"].astype(str)
+    sentinels_before = len(loci_df)
     loci_df["position"] = pd.to_numeric(loci_df["position"], errors="coerce").astype("Int64")
     loci_df = loci_df.dropna(subset=["chromosome", "position"])
+    sentinels_dropped = sentinels_before - len(loci_df)
+
+    if report:
+        report.counters["sentinels_raw"] = sentinels_before
+        report.counters["sentinels_valid"] = len(loci_df)
+        if sentinels_dropped:
+            report.warning(
+                "sentinels_dropped",
+                "sentinels dropped (invalid chromosome or position)",
+                count=sentinels_dropped,
+            )
 
     # Store raw sentinels as loci_<study_name>
     raw_table = f"loci_{study_name}"
@@ -168,6 +182,8 @@ def add_study(
 
         if trait_sentinels.empty:
             logger.warning(f"No sentinels for trait '{trait}' — skipping loci creation")
+            if report:
+                report.warning("empty_trait", f"no sentinels matched trait '{trait}'")
             continue
 
         # Cluster sentinels into loci
@@ -184,6 +200,12 @@ def add_study(
                               pvalue_column=pvalue_column,
                               rsid_column=rsid_column)
         total_loci += n_loci
+
+        if report:
+            report.info(
+                "trait_loci",
+                f"{trait}: {len(trait_sentinels)} sentinels -> {n_loci} loci",
+            )
 
         # Update n_loci on study
         if is_postgres(conn):

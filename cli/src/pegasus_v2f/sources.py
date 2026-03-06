@@ -12,6 +12,7 @@ import yaml
 from pegasus_v2f.db import is_postgres, raw_table_name, write_table
 from pegasus_v2f.db_meta import read_meta, write_meta
 from pegasus_v2f.loaders import load_source
+from pegasus_v2f.report import Report
 from pegasus_v2f.transform import apply_transformations, clean_for_db
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ def add_source(
     data_dir: Path | None = None,
     config: dict | None = None,
     no_score: bool = False,
+    report: Report | None = None,
 ) -> int:
     """Add a new data source: load data, write table, update stored config.
 
@@ -47,10 +49,12 @@ def add_source(
         raise ValueError(f"Source '{name}' already exists. Use --force to replace it.")
 
     # Load and transform
-    df = load_source(source, data_dir=data_dir)
+    load_report = report.child("load") if report else None
+    df = load_source(source, data_dir=data_dir, report=load_report)
     transformations = source.get("transformations", [])
     if transformations:
-        df = apply_transformations(df, transformations)
+        transform_report = report.child("transform") if report else None
+        df = apply_transformations(df, transformations, report=transform_report)
     df = clean_for_db(df)
 
     # Always write the raw table (all original columns, queryable)
@@ -60,7 +64,8 @@ def add_source(
     if evidence_blocks:
         # Load evidence into the unified evidence table
         from pegasus_v2f.evidence_loader import load_all_evidence
-        load_all_evidence(conn, source, df)
+        evidence_report = report.child("evidence") if report else None
+        load_all_evidence(conn, source, df, report=evidence_report)
 
     # Update stored config
     _append_source_to_meta(conn, source)
@@ -71,6 +76,9 @@ def add_source(
     except Exception:
         pass  # source_metadata may not exist outside full builds
 
+    if report:
+        report.counters["rows_out"] = len(df)
+
     logger.info(f"Added source '{name}': {len(df)} rows")
     return len(df)
 
@@ -80,6 +88,7 @@ def update_source(
     name: str,
     data_dir: Path | None = None,
     config: dict | None = None,
+    report: Report | None = None,
 ) -> int:
     """Re-fetch and reload an existing source from its stored config.
 
@@ -95,10 +104,12 @@ def update_source(
         raise ValueError(f"Source '{name}' not found in stored config")
 
     # Load and transform
-    df = load_source(source, data_dir=data_dir)
+    load_report = report.child("load") if report else None
+    df = load_source(source, data_dir=data_dir, report=load_report)
     transformations = source.get("transformations", [])
     if transformations:
-        df = apply_transformations(df, transformations)
+        transform_report = report.child("transform") if report else None
+        df = apply_transformations(df, transformations, report=transform_report)
     df = clean_for_db(df)
 
     # Always refresh the raw table
@@ -108,7 +119,8 @@ def update_source(
     if evidence_blocks:
         # Re-load evidence (loader handles cleanup per source_tag)
         from pegasus_v2f.evidence_loader import load_all_evidence
-        load_all_evidence(conn, source, df)
+        evidence_report = report.child("evidence") if report else None
+        load_all_evidence(conn, source, df, report=evidence_report)
     else:
         try:
             _upsert_source_metadata(conn, source, len(df))

@@ -7,6 +7,8 @@ import logging
 
 import pandas as pd
 
+from pegasus_v2f.report import Report
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,12 +52,17 @@ def clean_for_db(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def apply_transformations(df: pd.DataFrame, transformations: list[dict]) -> pd.DataFrame:
+def apply_transformations(
+    df: pd.DataFrame,
+    transformations: list[dict],
+    report: Report | None = None,
+) -> pd.DataFrame:
     """Apply a sequence of transformations to a DataFrame.
 
     Supported types: rename, select, deduplicate, custom.
     """
     for t in transformations:
+        rows_before = len(df)
         try:
             t_type = t["type"]
             if t_type == "rename":
@@ -68,8 +75,22 @@ def apply_transformations(df: pd.DataFrame, transformations: list[dict]) -> pd.D
                 df = _transform_custom(df, t)
             else:
                 logger.warning(f"Unknown transformation type: {t_type}")
+                if report:
+                    report.warning("unknown_transform", f"unknown transformation type: {t_type}")
+                continue
         except Exception as e:
             logger.warning(f"Transformation failed ({t}): {e}")
+            if report:
+                report.error("transform_failed", f"{t_type} transformation failed: {e}")
+            continue
+
+        if report:
+            rows_after = len(df)
+            if rows_after != rows_before:
+                report.info(
+                    "transform_rows",
+                    f"{t_type}: {rows_before} -> {rows_after} rows",
+                )
 
     return df
 

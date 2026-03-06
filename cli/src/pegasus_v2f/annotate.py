@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from pegasus_v2f.db import is_postgres, raw_table_name, write_table
+from pegasus_v2f.report import Report
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ def create_gene_annotations(
     conn: Any,
     genes: list[str],
     config: dict,
+    report: Report | None = None,
 ) -> None:
     """Fetch gene annotations from Ensembl and write to DB.
 
@@ -29,10 +31,15 @@ def create_gene_annotations(
     ga_config = config.get("gene_annotations", {})
     genome_build = config.get("database", {}).get("genome_build", "hg38")
 
+    if report:
+        report.counters["genes_requested"] = len(genes)
+
+    is_stub = False
     try:
         df = _fetch_ensembl_genes(genes, ga_config)
     except Exception as e:
         logger.warning(f"Ensembl fetch failed: {e}. Creating stub annotations.")
+        is_stub = True
         df = pd.DataFrame({
             "gene": genes,
             "ensembl_gene_id": [None] * len(genes),
@@ -42,12 +49,37 @@ def create_gene_annotations(
             "end_position": [None] * len(genes),
             "strand": [None] * len(genes),
         })
+        if report:
+            report.error(
+                "ensembl_failed",
+                f"Ensembl fetch failed: {e}. All {len(genes)} genes have stub annotations (NULL coordinates). "
+                "Scoring will find 0 candidate genes per locus.",
+            )
 
     df["genome_build"] = genome_build
 
     # Filter to valid chromosomes
+    before_filter = len(df)
     if "chromosome" in df.columns:
         df = df[df["chromosome"].isin(VALID_CHROMOSOMES) | df["chromosome"].isna()]
+    filtered_count = before_filter - len(df)
+
+    if report:
+        report.counters["genes_found"] = len(df)
+        if not is_stub:
+            not_found = len(genes) - len(df) - filtered_count
+            if not_found > 0:
+                report.warning(
+                    "genes_not_found",
+                    "gene symbols not found in Ensembl",
+                    count=not_found,
+                )
+        if filtered_count > 0:
+            report.warning(
+                "invalid_chromosome",
+                "genes filtered out (non-standard chromosome)",
+                count=filtered_count,
+            )
 
     # PEGASUS mode: insert into genes table
     if _has_table(conn, "genes"):

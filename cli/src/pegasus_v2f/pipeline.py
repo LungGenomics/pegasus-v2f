@@ -18,6 +18,7 @@ from pegasus_v2f.db import is_postgres, raw_table_name, write_table
 from pegasus_v2f.db_meta import write_build_meta
 from pegasus_v2f.db_schema import create_schema, has_tables, drop_all_tables
 from pegasus_v2f.loaders import load_source
+from pegasus_v2f.report import Report
 from pegasus_v2f.transform import apply_transformations, clean_for_db
 from pegasus_v2f.annotate import (
     create_gene_annotations,
@@ -33,6 +34,7 @@ def build_db(
     config: dict,
     project_root: Path | None = None,
     overwrite: bool = False,
+    report: Report | None = None,
 ) -> dict:
     """Build the entire database from config.
 
@@ -72,8 +74,9 @@ def build_db(
     is_pegasus = bool(config.get("pegasus"))
 
     if is_pegasus:
+        sources_report = report.child("sources") if report else None
         loaded_tables, all_genes, metadata_rows = process_data_sources_pegasus(
-            conn, sources, data_dir, config
+            conn, sources, data_dir, config, report=sources_report
         )
     else:
         loaded_tables, all_genes, metadata_rows = process_data_sources(
@@ -88,14 +91,18 @@ def build_db(
     # Gene annotations
     if all_genes:
         logger.info(f"Creating gene annotations for {len(all_genes)} genes")
-        create_gene_annotations(conn, list(all_genes), config)
+        annotate_report = report.child("annotate") if report else None
+        create_gene_annotations(conn, list(all_genes), config, report=annotate_report)
     else:
         logger.warning("No genes found — skipping annotations")
+        if report:
+            report.warning("no_genes", "no gene symbols found in any source — skipping annotations")
 
     if is_pegasus:
         # Scoring
         from pegasus_v2f.scoring import materialize_scored_evidence
-        n_scored = materialize_scored_evidence(conn, config)
+        score_report = report.child("scoring") if report else None
+        n_scored = materialize_scored_evidence(conn, config, report=score_report)
         logger.info(f"Scored {n_scored} locus-gene pairs")
 
         # PEGASUS search index (from evidence tables)
@@ -122,6 +129,7 @@ def process_data_sources_pegasus(
     sources: list[dict],
     data_dir: Path | None,
     config: dict,
+    report: Report | None = None,
 ) -> tuple[list[str], set[str], list[dict]]:
     """PEGASUS-aware multi-pass data source processing.
 
@@ -155,10 +163,10 @@ def process_data_sources_pegasus(
         else:
             other_evidence_sources.append(source)
 
-    # Pass 1a: Locus definition sources
-    for source in locus_def_sources:
+    def _process_source(source: dict, pass_name: str) -> pd.DataFrame | None:
+        """Load a source, report success/failure, return DataFrame or None."""
         name = source["name"]
-        logger.info(f"Pass 1a (locus_definition): {name}")
+        logger.info(f"{pass_name}: {name}")
         try:
             df = _load_and_transform(source, data_dir)
             write_table(conn, raw_table_name(name), df)
@@ -167,48 +175,32 @@ def process_data_sources_pegasus(
                 logger.info(f"  {result}")
             loaded_tables.append(name)
             all_genes.update(_collect_genes(df))
+            if report:
+                report.info("source_loaded", f"{name}: {len(df)} rows")
+            return df
         except Exception as e:
             logger.error(f"  Failed: {e}")
+            if report:
+                report.error("source_failed", f"{name}: {e}")
+            return None
+
+    # Pass 1a: Locus definition sources
+    for source in locus_def_sources:
+        _process_source(source, "Pass 1a (locus_definition)")
 
     # Pass 1b: GWAS sumstats sources
     for source in sumstats_sources:
-        name = source["name"]
-        logger.info(f"Pass 1b (gwas_sumstats): {name}")
-        try:
-            df = _load_and_transform(source, data_dir)
-            write_table(conn, raw_table_name(name), df)
-            result = load_all_evidence(conn, source, df)
-            if result:
-                logger.info(f"  {result}")
-            loaded_tables.append(name)
-            all_genes.update(_collect_genes(df))
-        except Exception as e:
-            logger.error(f"  Failed: {e}")
+        _process_source(source, "Pass 1b (gwas_sumstats)")
 
     # Pass 2: Other evidence sources
     for source in other_evidence_sources:
-        name = source["name"]
-        logger.info(f"Pass 2 (evidence): {name}")
-        try:
-            df = _load_and_transform(source, data_dir)
-            write_table(conn, raw_table_name(name), df)
-            result = load_all_evidence(conn, source, df)
-            if result:
-                logger.info(f"  {result}")
-            loaded_tables.append(name)
-            all_genes.update(_collect_genes(df))
-        except Exception as e:
-            logger.error(f"  Failed: {e}")
+        _process_source(source, "Pass 2 (evidence)")
 
     # Pass 3: Raw sources (exploration only)
     for source in raw_sources:
         name = source["name"]
-        logger.info(f"Pass 3 (raw): {name}")
-        try:
-            df = _load_and_transform(source, data_dir)
-            write_table(conn, raw_table_name(name), df)
-            loaded_tables.append(name)
-            all_genes.update(_collect_genes(df))
+        df = _process_source(source, "Pass 3 (raw)")
+        if df is not None:
             metadata_rows.append({
                 "table_name": raw_table_name(name),
                 "display_name": source.get("display_name", name),
@@ -220,9 +212,11 @@ def process_data_sources_pegasus(
                 "include_in_search": source.get("include_in_search", True),
                 "last_updated": datetime.now(timezone.utc).isoformat(),
             })
-            logger.info(f"  Loaded raw table: {len(df)} rows")
-        except Exception as e:
-            logger.error(f"  Failed: {e}")
+
+    if report:
+        report.counters["sources_loaded"] = len(loaded_tables)
+        report.counters["sources_total"] = len(sources)
+        report.counters["sources_failed"] = len(sources) - len(loaded_tables)
 
     return loaded_tables, all_genes, metadata_rows
 

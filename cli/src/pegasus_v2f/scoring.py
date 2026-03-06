@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from pegasus_v2f.db import is_postgres
+from pegasus_v2f.report import Report
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,7 @@ def materialize_scored_evidence(
     conn: Any,
     config: dict,
     study_name: str | None = None,
+    report: Report | None = None,
 ) -> int:
     """Materialize scored_evidence from evidence × loci × genes.
 
@@ -65,18 +67,38 @@ def materialize_scored_evidence(
             ).fetchall()
             all_genes = [r[0] for r in rows if r[0]]
             if all_genes:
-                create_gene_annotations(conn, all_genes, config)
+                create_gene_annotations(conn, all_genes, config, report=report)
                 logger.info(f"Fetched annotations for {len(all_genes)} genes")
+        if report:
+            gene_count = conn.execute("SELECT COUNT(*) FROM genes").fetchone()[0]
+            report.counters["genes_with_coordinates"] = gene_count
+            if gene_count == 0:
+                report.error(
+                    "no_genes",
+                    "genes table is empty — scoring will find 0 candidate genes per locus",
+                )
     except Exception as e:
         logger.warning(f"Could not check/fetch gene annotations: {e}")
+        if report:
+            report.error("gene_check_failed", f"could not check/fetch gene annotations: {e}")
 
     # Get loci (all or for target study)
     loci = _get_loci(conn, study_name)
     if not loci:
         logger.warning("No loci found — skipping scoring")
+        if report:
+            report.warning("no_loci", "no loci found — nothing to score")
         return 0
 
+    if report:
+        report.counters["loci"] = len(loci)
+
     total_rows = 0
+    loci_no_candidates = 0
+    loci_no_evidence = 0
+    total_variant_evidence = 0
+    total_gene_evidence = 0
+    total_stub_rows = 0
 
     for locus in loci:
         locus_id = locus["locus_id"]
@@ -113,6 +135,14 @@ def materialize_scored_evidence(
         for ev in gene_evidence:
             evidence_rows.append({**ev, "match_type": "gene"})
 
+        # Track per-locus stats
+        if not candidate_genes:
+            loci_no_candidates += 1
+        if not evidence_rows:
+            loci_no_evidence += 1
+        total_variant_evidence += len(variant_evidence)
+        total_gene_evidence += len(gene_evidence)
+
         # Group by gene, count categories, compute rank
         gene_scores = _score_genes(evidence_rows, candidate_genes)
         n_candidates = len(set(candidate_genes) | {ev["gene_symbol"] for ev in evidence_rows})
@@ -146,6 +176,7 @@ def materialize_scored_evidence(
                     n_candidate_genes=n_candidates,
                 )
                 total_rows += 1
+                total_stub_rows += 1
 
     # Update candidate gene counts on loci table
     conn.execute("""
@@ -165,6 +196,27 @@ def materialize_scored_evidence(
         logger.info("Rebuilt gene_search_index")
     except Exception as e:
         logger.warning(f"Could not rebuild gene_search_index: {e}")
+        if report:
+            report.error("search_index_failed", f"could not rebuild search index: {e}")
+
+    # --- Report ---
+    if report:
+        report.counters["scored_evidence_rows"] = total_rows
+        report.counters["variant_evidence_matched"] = total_variant_evidence
+        report.counters["gene_evidence_matched"] = total_gene_evidence
+        report.counters["stub_rows"] = total_stub_rows
+        if loci_no_candidates:
+            report.warning(
+                "loci_no_candidates",
+                "loci had 0 candidate genes (genes table may be missing coordinates)",
+                count=loci_no_candidates,
+            )
+        if loci_no_evidence:
+            report.warning(
+                "loci_no_evidence",
+                "loci had 0 evidence rows matched",
+                count=loci_no_evidence,
+            )
 
     logger.info(f"Materialized {total_rows} scored_evidence rows")
     return total_rows

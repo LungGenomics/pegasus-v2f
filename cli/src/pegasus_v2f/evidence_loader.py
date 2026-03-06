@@ -14,11 +14,18 @@ import pandas as pd
 
 from pegasus_v2f.db import is_postgres
 from pegasus_v2f.evidence_config import resolve_evidence_mapping
+from pegasus_v2f.report import Report
 
 logger = logging.getLogger(__name__)
 
 
-def load_evidence(conn: Any, source: dict, df: pd.DataFrame, evidence_block: dict) -> dict:
+def load_evidence(
+    conn: Any,
+    source: dict,
+    df: pd.DataFrame,
+    evidence_block: dict,
+    report: Report | None = None,
+) -> dict:
     """Load a single evidence block into the evidence table.
 
     Args:
@@ -69,9 +76,14 @@ def load_evidence(conn: Any, source: dict, df: pd.DataFrame, evidence_block: dic
         working["__trait__"] = None
 
     rows = []
+    empty_gene_count = 0
+    coercion_failures: dict[str, int] = {}  # field_name -> count
+    chr_formats_seen: set[str] = set()
+
     for _, row in working.iterrows():
         gene = str(row[gene_col])
         if not gene or gene == "nan":
+            empty_gene_count += 1
             continue
 
         evidence_row = {
@@ -86,11 +98,13 @@ def load_evidence(conn: Any, source: dict, df: pd.DataFrame, evidence_block: dic
             chrom_val = row[chr_col]
             pos_val = row[pos_col]
             if pd.notna(chrom_val) and pd.notna(pos_val):
-                evidence_row["chromosome"] = str(chrom_val)
+                chrom_str = str(chrom_val)
+                evidence_row["chromosome"] = chrom_str
+                chr_formats_seen.add(chrom_str[:5])  # e.g. "chr6" or "6"
                 try:
                     evidence_row["position"] = int(float(pos_val))
                 except (ValueError, TypeError):
-                    pass
+                    coercion_failures["position"] = coercion_failures.get("position", 0) + 1
 
         # Optional fields
         if rsid_col and pd.notna(row.get(rsid_col)):
@@ -99,17 +113,17 @@ def load_evidence(conn: Any, source: dict, df: pd.DataFrame, evidence_block: dic
             try:
                 evidence_row["pvalue"] = float(row[pval_col])
             except (ValueError, TypeError):
-                pass
+                coercion_failures["pvalue"] = coercion_failures.get("pvalue", 0) + 1
         if effect_col and pd.notna(row.get(effect_col)):
             try:
                 evidence_row["effect_size"] = float(row[effect_col])
             except (ValueError, TypeError):
-                pass
+                coercion_failures["effect_size"] = coercion_failures.get("effect_size", 0) + 1
         if score_col and pd.notna(row.get(score_col)):
             try:
                 evidence_row["score"] = float(row[score_col])
             except (ValueError, TypeError):
-                pass
+                coercion_failures["score"] = coercion_failures.get("score", 0) + 1
         if tissue_col and pd.notna(row.get(tissue_col)):
             evidence_row["tissue"] = str(row[tissue_col])
         if cell_type_col and pd.notna(row.get(cell_type_col)):
@@ -124,7 +138,7 @@ def load_evidence(conn: Any, source: dict, df: pd.DataFrame, evidence_block: dic
         rows.append(evidence_row)
 
     # Bulk insert
-    inserted = _bulk_insert_evidence(conn, rows)
+    inserted = _bulk_insert_evidence(conn, rows, report=report)
 
     # Update data_sources provenance
     _upsert_data_source(
@@ -135,6 +149,31 @@ def load_evidence(conn: Any, source: dict, df: pd.DataFrame, evidence_block: dic
         url=source.get("url"),
     )
 
+    # --- Report ---
+    if report:
+        report.counters["rows_examined"] = len(working)
+        report.counters["rows_built"] = len(rows)
+        report.counters["rows_inserted"] = inserted
+        if empty_gene_count:
+            report.warning(
+                "empty_gene",
+                "rows dropped — gene column was empty or NaN",
+                count=empty_gene_count,
+            )
+        for field_name, count in coercion_failures.items():
+            report.warning(
+                "coercion_failed",
+                f"non-numeric {field_name} values (field dropped, row kept)",
+                count=count,
+                field=field_name,
+            )
+        if chr_formats_seen:
+            report.info(
+                "chr_formats",
+                f"chromosome formats seen: {', '.join(sorted(chr_formats_seen))}",
+                count=len(chr_formats_seen),
+            )
+
     logger.info(f"Evidence loaded: {inserted} rows ({category}, source_tag={source_tag})")
     return {
         "rows_inserted": inserted,
@@ -143,7 +182,12 @@ def load_evidence(conn: Any, source: dict, df: pd.DataFrame, evidence_block: dic
     }
 
 
-def load_all_evidence(conn: Any, source: dict, df: pd.DataFrame) -> list[dict]:
+def load_all_evidence(
+    conn: Any,
+    source: dict,
+    df: pd.DataFrame,
+    report: Report | None = None,
+) -> list[dict]:
     """Load all evidence blocks from a source config.
 
     Iterates over source["evidence"] (always a list) and calls load_evidence
@@ -157,7 +201,8 @@ def load_all_evidence(conn: Any, source: dict, df: pd.DataFrame) -> list[dict]:
 
     results = []
     for block in evidence_blocks:
-        result = load_evidence(conn, source, df, block)
+        child = report.child(f"evidence:{block.get('source_tag', '?')}") if report else None
+        result = load_evidence(conn, source, df, block, report=child)
         results.append(result)
 
     return results
@@ -175,7 +220,9 @@ def _cleanup_evidence(conn: Any, source_tag: str) -> None:
     logger.debug(f"Cleaned up previous evidence for source_tag '{source_tag}'")
 
 
-def _bulk_insert_evidence(conn: Any, rows: list[dict]) -> int:
+def _bulk_insert_evidence(
+    conn: Any, rows: list[dict], report: Report | None = None,
+) -> int:
     """Insert evidence rows into the evidence table. Returns count inserted."""
     if not rows:
         return 0
@@ -189,6 +236,7 @@ def _bulk_insert_evidence(conn: Any, rows: list[dict]) -> int:
     ]
 
     inserted = 0
+    insert_failures = 0
     for row in rows:
         values = [row.get(col) for col in columns]
         try:
@@ -209,7 +257,15 @@ def _bulk_insert_evidence(conn: Any, rows: list[dict]) -> int:
                 )
             inserted += 1
         except Exception as e:
+            insert_failures += 1
             logger.warning(f"Failed to insert evidence row: {e}")
+
+    if report and insert_failures:
+        report.error(
+            "insert_failed",
+            "rows failed to insert into evidence table",
+            count=insert_failures,
+        )
 
     return inserted
 
