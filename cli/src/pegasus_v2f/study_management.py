@@ -42,6 +42,7 @@ def add_study(
     window_kb: int = DEFAULT_WINDOW_KB,
     merge_distance_kb: int = DEFAULT_MERGE_DISTANCE_KB,
     cache_dir: Path | None = None,
+    transformations: list[dict] | None = None,
     config_path: Path | None = None,
     report: Report | None = None,
 ) -> dict:
@@ -115,6 +116,11 @@ def add_study(
 
     # Normalize column names
     loci_df.columns = [c.strip().lower() for c in loci_df.columns]
+
+    # Apply user/AI transformations before built-in normalization
+    if transformations:
+        from pegasus_v2f.transform import apply_transformations
+        loci_df = apply_transformations(loci_df, transformations, report=report)
 
     # Validate required columns
     if "chromosome" not in loci_df.columns and "chr" not in loci_df.columns:
@@ -685,7 +691,8 @@ def _sync_study_to_yaml(
     study_config = {"id_prefix": study_name, "traits": traits}
     for key in ("gwas_source", "ancestry", "sex", "sample_size", "doi", "year",
                  "genome_build", "loci_source", "loci_sheet", "loci_skip",
-                 "gene_column", "sentinel_column", "pvalue_column", "rsid_column"):
+                 "gene_column", "sentinel_column", "pvalue_column", "rsid_column",
+                 "transformations"):
         if kwargs.get(key) is not None:
             study_config[key] = kwargs[key]
 

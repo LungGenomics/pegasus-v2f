@@ -19,7 +19,7 @@ click.rich_click.COMMAND_GROUPS = {
         {"name": "Commands", "commands": ["list", "add", "show", "update", "remove"]},
     ],
     "v2f study": [
-        {"name": "Commands", "commands": ["list", "add", "show", "preview", "set", "remove"]},
+        {"name": "Commands", "commands": ["list", "add", "inspect", "show", "preview", "set", "remove"]},
     ],
 }
 
@@ -374,6 +374,7 @@ def rebuild(ctx):
                 rsid_column=study_cfg.get("rsid_column"),
                 window_kb=locus_def.get("window_kb", 500),
                 merge_distance_kb=locus_def.get("merge_distance_kb", 250),
+                transformations=study_cfg.get("transformations"),
                 cache_dir=root / ".v2f",
                 config_path=None,  # Don't re-write yaml during rebuild
                 report=study_report,
@@ -559,6 +560,78 @@ def _columns_from_preview(preview_df, skip_rows=0):
                 pass
         columns.append({"name": col, "type": col_type, "sample_values": samples})
     return columns
+
+
+def _confirm_column_mappings(proposals: dict, available_columns: list, *, label: str = "Detected") -> dict:
+    """Confirm column mappings: show summary, accept or edit per-column.
+
+    Works for both heuristic and AI-detected mappings.
+
+    Args:
+        proposals: role -> column_name (e.g. {"gene": "nearest_gene", "pvalue": "P/cP"})
+        available_columns: list of actual column names in the DataFrame
+        label: prefix for the display line (e.g. "Detected" or "AI")
+
+    Returns:
+        Accepted mappings: role -> column_name
+    """
+    import questionary
+
+    role_labels = {
+        "gene": "Nearest gene column",
+        "chromosome": "Chromosome column",
+        "position": "Position column",
+        "sentinel_id": "Sentinel variant ID column",
+        "pvalue": "P-value column",
+        "rsid": "rsID column",
+        "score": "Score column",
+        "effect_size": "Effect size column",
+    }
+
+    # Show one-line summary
+    summary = ", ".join(f"{r}: {c}" for r, c in proposals.items())
+    click.echo(f"\n  {label} column mappings: {{{summary}}}")
+
+    if click.confirm("  Accept?", default=True):
+        return dict(proposals)
+
+    # Per-column edit
+    col_choices = ["(none)"] + [str(c) for c in available_columns]
+    accepted = {}
+    for role, suggested in proposals.items():
+        role_label = role_labels.get(role, role)
+        default = suggested if suggested in col_choices else "(none)"
+        answer = questionary.select(
+            f"  {role_label}:",
+            choices=col_choices,
+            default=default,
+        ).ask()
+        if answer is None:
+            return accepted
+        if answer != "(none)":
+            accepted[role] = answer
+
+    return accepted
+
+
+def _ai_transforms_to_fixes(transformations):
+    """Convert AI-suggested transformation dicts to SuggestedFix objects."""
+    from pegasus_v2f.inspect import SuggestedFix
+
+    fixes = []
+    for t in transformations:
+        t_type = t.get("type", "unknown")
+        col = t.get("column", t.get("columns", "N/A"))
+        if isinstance(col, dict):
+            col = ", ".join(f"{k}->{v}" for k, v in col.items())
+        elif isinstance(col, list):
+            col = ", ".join(col)
+        fixes.append(SuggestedFix(
+            code=f"ai_{t_type}",
+            message=f"{t_type} on {col}",
+            transformation=t,
+        ))
+    return fixes
 
 
 def _apply_suggested_fixes(fixes):
@@ -943,15 +1016,44 @@ def source_add(ctx, name, source_type, url, file_path, sheet, skip_rows, gene_co
             inspection = inspect_dataframe(inspect_df, source_name=name)
             render_inspection(inspection)
 
-            # AI suggestion
+            # Column mapping confirmation + transformations
             if use_ai:
-                ai_suggestion = _show_ai_suggestion(inspection)
+                ai_suggestion = _show_ai_suggestion(
+                    inspection, heuristic_fixes=inspection.suggested_fixes,
+                )
+                if ai_suggestion and ai_suggestion.column_mappings:
+                    accepted_cols = _confirm_column_mappings(
+                        ai_suggestion.column_mappings, inspect_df.columns.tolist(),
+                        label="AI",
+                    )
+                    if not gene_column and accepted_cols.get("gene"):
+                        gene_column = accepted_cols["gene"]
 
-            # Interactive fix application
-            if inspection.suggested_fixes:
-                accepted_transforms = _apply_suggested_fixes(inspection.suggested_fixes)
-                if accepted_transforms:
-                    source_def.setdefault("transformations", []).extend(accepted_transforms)
+                if ai_suggestion and ai_suggestion.transformations:
+                    ai_fixes = _ai_transforms_to_fixes(ai_suggestion.transformations)
+                    accepted_transforms = _apply_suggested_fixes(ai_fixes)
+                    if accepted_transforms:
+                        source_def.setdefault("transformations", []).extend(accepted_transforms)
+                elif inspection.suggested_fixes:
+                    accepted_transforms = _apply_suggested_fixes(inspection.suggested_fixes)
+                    if accepted_transforms:
+                        source_def.setdefault("transformations", []).extend(accepted_transforms)
+            else:
+                # Heuristic mode — confirm detected mappings
+                if inspection.suggested_mappings:
+                    accepted_cols = _confirm_column_mappings(
+                        inspection.suggested_mappings, inspect_df.columns.tolist(),
+                        label="Detected",
+                    )
+                    if not gene_column and accepted_cols.get("gene"):
+                        gene_column = accepted_cols["gene"]
+
+                if inspection.suggested_fixes:
+                    accepted_transforms = _apply_suggested_fixes(inspection.suggested_fixes)
+                    if accepted_transforms:
+                        source_def.setdefault("transformations", []).extend(accepted_transforms)
+        except (KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
             click.echo(f"  Inspection skipped: {e}", err=True)
 
@@ -1065,7 +1167,13 @@ def source_inspect(ctx, name, source_type, url, file_path, sheet, skip_rows, use
             data_dir = root
 
     try:
-        df = load_source(source_def, data_dir=data_dir)
+        if url:
+            from rich.console import Console
+            console = Console(stderr=True)
+            with console.status("Downloading source..."):
+                df = load_source(source_def, data_dir=data_dir)
+        else:
+            df = load_source(source_def, data_dir=data_dir)
     except Exception as e:
         raise click.ClickException(f"Could not load source: {e}")
 
@@ -1079,7 +1187,7 @@ def source_inspect(ctx, name, source_type, url, file_path, sheet, skip_rows, use
             from pegasus_v2f.ai_assist import get_provider
             provider = get_provider("auto")
             if provider:
-                suggestion = provider.suggest(result)
+                suggestion = provider.suggest(result, heuristic_fixes=result.suggested_fixes)
                 if suggestion:
                     output["ai_suggestion"] = suggestion.to_dict()
                 else:
@@ -1092,11 +1200,15 @@ def source_inspect(ctx, name, source_type, url, file_path, sheet, skip_rows, use
     render_inspection(result)
 
     if use_ai:
-        _show_ai_suggestion(result)
+        _show_ai_suggestion(result, heuristic_fixes=result.suggested_fixes)
 
 
-def _show_ai_suggestion(result):
-    """Run AI provider and display suggestion. Gracefully degrades on failure."""
+def _show_ai_suggestion(result, *, heuristic_fixes=None):
+    """Run AI provider and display suggestion. Gracefully degrades on failure.
+
+    When heuristic_fixes is provided, passes them to the AI so it can
+    produce authoritative structured transformations.
+    """
     from pegasus_v2f.ai_assist import get_provider
     from pegasus_v2f.pegasus_schema import EVIDENCE_CATEGORIES
     from rich.console import Console
@@ -1109,7 +1221,7 @@ def _show_ai_suggestion(result):
         return None
 
     console.print(f"\n  [dim]Running AI analysis ({provider.name})...[/dim]")
-    suggestion = provider.suggest(result)
+    suggestion = provider.suggest(result, heuristic_fixes=heuristic_fixes)
     if not suggestion:
         console.print("  [yellow]AI suggestion failed — continuing without AI[/yellow]\n")
         return None
@@ -1127,6 +1239,15 @@ def _show_ai_suggestion(result):
         console.print(f"\n    Notes:")
         for note in suggestion.quality_notes:
             console.print(f"    - {note}")
+    if suggestion.transformations:
+        console.print(f"\n    Transformations:")
+        for t in suggestion.transformations:
+            col = t.get("column", t.get("columns", "N/A"))
+            if isinstance(col, dict):
+                col = ", ".join(f"{k}->{v}" for k, v in col.items())
+            elif isinstance(col, list):
+                col = ", ".join(col)
+            console.print(f"    - {t['type']} on {col}")
     console.print(f"    Confidence: {suggestion.confidence:.0%}\n")
 
     return suggestion
@@ -1480,6 +1601,169 @@ def study_list(ctx):
     console.print(table)
 
 
+@study.command("inspect")
+@handle_errors
+@click.argument("loci_file")
+@click.option("--sheet", default=None, help="Sheet/tab name (for Excel or Google Sheets).")
+@click.option("--skip", "skip_rows", default=None, type=int, help="Rows to skip before header.")
+@click.option("--window-kb", type=int, default=500, help="Locus window half-size in kb (default: 500).")
+@click.option("--merge-kb", type=int, default=250, help="Merge distance in kb (default: 250).")
+@click.option("--chr-column", default=None, help="Specify chromosome column name.")
+@click.option("--pos-column", default=None, help="Specify position column name.")
+@click.option("--gene-column", default=None, help="Specify gene column name.")
+@click.option("--pvalue-column", default=None, help="Specify p-value column name.")
+@click.option("--rsid-column", default=None, help="Specify rsID column name.")
+@click.option("--sentinel-column", default=None, help="Specify variant ID column name.")
+@click.option("--ai", "use_ai", is_flag=True, help="Enable AI-assisted analysis.")
+@click.option("--json", "json_output", is_flag=True, help="Output structured JSON.")
+@click.pass_context
+def study_inspect(ctx, loci_file, sheet, skip_rows, window_kb, merge_kb,
+                  chr_column, pos_column,
+                  gene_column, pvalue_column, rsid_column, sentinel_column,
+                  use_ai, json_output):
+    """Inspect sentinel variant data before adding a study.
+
+    Profiles columns, validates positions, detects traits, and previews
+    how sentinels will cluster into loci. LOCI_FILE can be a local path
+    or a Google Sheets URL.
+    """
+    from pathlib import Path
+
+    import pandas as pd
+
+    from pegasus_v2f.project import find_project_root
+    from pegasus_v2f.study_inspect import inspect_sentinels, render_study_inspection
+
+    root = find_project_root(ctx.obj.get("project"))
+    cache_dir = root / ".v2f" if root else None
+
+    # Load sentinel data — same logic as study_add
+    loci_df = None
+    if loci_file.startswith("http"):
+        from pegasus_v2f.loaders import load_googlesheets
+
+        from rich.console import Console
+
+        console = Console(stderr=True)
+        source_spec = {"url": loci_file, "source_type": "googlesheets"}
+        if sheet:
+            source_spec["sheet"] = sheet
+        if skip_rows:
+            source_spec["skip_rows"] = skip_rows
+        try:
+            with console.status("Downloading spreadsheet..."):
+                loci_df = load_googlesheets(source_spec)
+        except Exception as e:
+            raise click.ClickException(f"Could not load Google Sheet: {e}")
+    else:
+        loci_path = Path(loci_file)
+        if not loci_path.exists():
+            raise click.ClickException(f"File not found: {loci_path}")
+
+        if loci_path.suffix.lower() in (".xlsx", ".xls"):
+            kwargs = {"engine": "calamine"}
+            if sheet:
+                kwargs["sheet_name"] = sheet
+            if skip_rows:
+                kwargs["skiprows"] = skip_rows
+            loci_df = pd.read_excel(loci_path, **kwargs)
+        elif loci_path.suffix.lower() in (".tsv", ".gz"):
+            loci_df = pd.read_csv(loci_path, sep="\t")
+        else:
+            loci_df = pd.read_csv(loci_path)
+
+    if loci_df is None or loci_df.empty:
+        raise click.ClickException("No data loaded from sentinel file")
+
+    label = sheet or loci_file.rstrip("/").split("/")[-1] or loci_file
+
+    # AI-first column detection: if --ai is set and key columns weren't
+    # specified explicitly, try AI to detect unusual column names
+    if use_ai and not (chr_column and pos_column):
+        from pegasus_v2f.ai_assist import get_provider
+        from pegasus_v2f.study_inspect import _detect_sentinel_columns
+
+        # Quick heuristic check first — only call AI if heuristics miss chr/pos
+        quick_det = _detect_sentinel_columns(loci_df)
+        if not (chr_column or quick_det.chromosome) or not (pos_column or quick_det.position):
+            provider = get_provider("auto")
+            if provider:
+                from pegasus_v2f.inspect import _profile_columns
+
+                click.echo("Auto-detection missed key columns, asking AI...", err=True)
+                col_summaries = [c.to_dict() for c in _profile_columns(loci_df)]
+                ai_cols = provider.suggest_columns(col_summaries, context="sentinel")
+                if ai_cols and ai_cols.mappings:
+                    if not chr_column and "chromosome" in ai_cols.mappings:
+                        chr_column = ai_cols.mappings["chromosome"]
+                        click.echo(f"  AI detected chromosome -> {chr_column}", err=True)
+                    if not pos_column and "position" in ai_cols.mappings:
+                        pos_column = ai_cols.mappings["position"]
+                        click.echo(f"  AI detected position -> {pos_column}", err=True)
+                    if not gene_column and "gene" in ai_cols.mappings:
+                        gene_column = ai_cols.mappings["gene"]
+                        click.echo(f"  AI detected gene -> {gene_column}", err=True)
+                    if not pvalue_column and "pvalue" in ai_cols.mappings:
+                        pvalue_column = ai_cols.mappings["pvalue"]
+                        click.echo(f"  AI detected pvalue -> {pvalue_column}", err=True)
+                    if not rsid_column and "rsid" in ai_cols.mappings:
+                        rsid_column = ai_cols.mappings["rsid"]
+                        click.echo(f"  AI detected rsid -> {rsid_column}", err=True)
+
+    result = inspect_sentinels(
+        loci_df,
+        source_label=label,
+        window_kb=window_kb,
+        merge_distance_kb=merge_kb,
+        cache_dir=cache_dir,
+        chr_col=chr_column,
+        pos_col=pos_column,
+        gene_col=gene_column,
+        pvalue_col=pvalue_column,
+        rsid_col=rsid_column,
+        sentinel_col=sentinel_column,
+    )
+
+    # Warn if key columns still missing
+    det = result.column_detection
+    if not det.chromosome or not det.position:
+        missing = []
+        if not det.chromosome:
+            missing.append("chromosome")
+        if not det.position:
+            missing.append("position")
+        click.echo(
+            f"Warning: Could not detect {', '.join(missing)} column(s). "
+            f"Clustering preview skipped.\n"
+            f"  Use --chr-column/--pos-column to specify, or --ai for AI detection.",
+            err=True,
+        )
+
+    if json_output or ctx.obj.get("json_output"):
+        import json as _json
+
+        output = result.to_dict()
+        if use_ai:
+            from pegasus_v2f.ai_assist import get_provider
+
+            provider = get_provider("auto")
+            if provider:
+                suggestion = provider.suggest(result, heuristic_fixes=result.suggested_fixes)
+                if suggestion:
+                    output["ai_suggestion"] = suggestion.to_dict()
+                else:
+                    click.echo("AI suggestion failed — showing inspection only.", err=True)
+            else:
+                click.echo("AI provider not available (claude CLI not found).", err=True)
+        print(_json.dumps(output, indent=2))
+        return
+
+    render_study_inspection(result)
+
+    if use_ai:
+        _show_ai_suggestion(result, heuristic_fixes=result.suggested_fixes)
+
+
 @study.command("add")
 @handle_errors
 @click.argument("study_name", required=False)
@@ -1500,11 +1784,12 @@ def study_list(ctx):
 @click.option("--window-kb", type=int, default=500, help="Locus window half-size in kb (default: 500)")
 @click.option("--merge-kb", type=int, default=250, help="Merge distance in kb (default: 250)")
 @click.option("--force", is_flag=True, help="Replace study if it already exists.")
+@click.option("--ai", "use_ai", is_flag=True, help="AI-assisted inspection and transformations before adding.")
 @click.pass_context
 def study_add(ctx, study_name, loci_file, loci_sheet, loci_skip, gene_column,
               sentinel_column, pvalue_column, rsid_column,
               traits_str, gwas_source, ancestry,
-              sex, sample_size, doi, year, window_kb, merge_kb, force):
+              sex, sample_size, doi, year, window_kb, merge_kb, force, use_ai):
     """Add a new study with loci from a sentinel variant file.
 
     If STUDY_NAME, --loci, and --traits are provided, runs non-interactively.
@@ -1662,66 +1947,98 @@ def study_add(ctx, study_name, loci_file, loci_sheet, loci_skip, gene_column,
                 loci_df = pd.read_excel(loci_path, **kwargs)
                 loci_path = None  # use loci_df instead
 
-    # --- Remaining interactive prompts (after preview) ---
+    # --- Inspection + column mapping (before remaining prompts) ---
+    accepted_transforms = None
+    if loci_file:
+        inspect_df = loci_df
+        if inspect_df is None and loci_path is not None:
+            try:
+                inspect_df = pd.read_csv(
+                    loci_path,
+                    sep="\t" if str(loci_path).endswith((".tsv", ".gz")) else ",",
+                )
+            except Exception:
+                inspect_df = None
+
+        if inspect_df is not None:
+            try:
+                from pegasus_v2f.study_inspect import inspect_sentinels, render_study_inspection
+
+                label = loci_sheet or (loci_file.rstrip("/").split("/")[-1] if "/" in loci_file else loci_file)
+                inspection = inspect_sentinels(
+                    inspect_df,
+                    source_label=label,
+                    window_kb=window_kb,
+                    merge_distance_kb=merge_kb,
+                    cache_dir=root / ".v2f",
+                    gene_col=gene_column,
+                    pvalue_col=pvalue_column,
+                    rsid_col=rsid_column,
+                    sentinel_col=sentinel_column,
+                )
+                render_study_inspection(inspection)
+
+                # Build column proposals from heuristic or AI
+                col_proposals = {}
+                available_cols = inspect_df.columns.tolist()
+
+                ai_suggestion = None
+                if use_ai:
+                    ai_suggestion = _show_ai_suggestion(
+                        inspection, heuristic_fixes=inspection.suggested_fixes,
+                    )
+                    if ai_suggestion and ai_suggestion.column_mappings:
+                        m = ai_suggestion.column_mappings
+                        for role in ("gene", "sentinel_id", "pvalue", "rsid"):
+                            if m.get(role):
+                                col_proposals[role] = m[role]
+                else:
+                    # Heuristic detection
+                    det = inspection.column_detection
+                    if det.gene:
+                        col_proposals["gene"] = det.gene
+                    if det.sentinel_id:
+                        col_proposals["sentinel_id"] = det.sentinel_id
+                    if det.pvalue:
+                        col_proposals["pvalue"] = det.pvalue
+                    if det.rsid:
+                        col_proposals["rsid"] = det.rsid
+
+                # 1. Column mappings first
+                unset_proposals = {}
+                if not gene_column and col_proposals.get("gene"):
+                    unset_proposals["gene"] = col_proposals["gene"]
+                if not sentinel_column and col_proposals.get("sentinel_id"):
+                    unset_proposals["sentinel_id"] = col_proposals["sentinel_id"]
+                if not pvalue_column and col_proposals.get("pvalue"):
+                    unset_proposals["pvalue"] = col_proposals["pvalue"]
+                if not rsid_column and col_proposals.get("rsid"):
+                    unset_proposals["rsid"] = col_proposals["rsid"]
+
+                if unset_proposals:
+                    source_label = "AI" if use_ai else "Detected"
+                    accepted_cols = _confirm_column_mappings(
+                        unset_proposals, available_cols, label=source_label,
+                    )
+                    gene_column = accepted_cols.get("gene", gene_column)
+                    sentinel_column = accepted_cols.get("sentinel_id", sentinel_column)
+                    pvalue_column = accepted_cols.get("pvalue", pvalue_column)
+                    rsid_column = accepted_cols.get("rsid", rsid_column)
+
+                # 2. Transforms second
+                if use_ai and ai_suggestion and ai_suggestion.transformations:
+                    ai_fixes = _ai_transforms_to_fixes(ai_suggestion.transformations)
+                    accepted_transforms = _apply_suggested_fixes(ai_fixes)
+                elif inspection.suggested_fixes:
+                    accepted_transforms = _apply_suggested_fixes(inspection.suggested_fixes)
+
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:
+                click.echo(f"  Inspection skipped: {e}", err=True)
+
+    # --- Remaining interactive prompts (after inspection) ---
     if interactive:
-        if gene_column is None and loci_file:
-            # Offer gene column selection from available columns
-            available_cols = []
-            if loci_df is not None:
-                available_cols = [str(c) for c in loci_df.columns]
-            elif loci_path is not None:
-                # Peek at header for TSV/CSV files
-                try:
-                    peek = pd.read_csv(loci_path, nrows=0, sep="\t" if str(loci_path).endswith((".tsv", ".gz")) else ",")
-                    available_cols = [str(c) for c in peek.columns]
-                except Exception:
-                    pass
-            if available_cols:
-                col_choices = ["(none)"] + available_cols
-
-                if gene_column is None:
-                    gene_answer = questionary.select(
-                        "Nearest gene column (stored on loci, not scored):",
-                        choices=col_choices,
-                        default="(none)",
-                    ).ask()
-                    if gene_answer is None:
-                        raise SystemExit(0)
-                    if gene_answer != "(none)":
-                        gene_column = gene_answer
-
-                if sentinel_column is None:
-                    sent_answer = questionary.select(
-                        "Sentinel variant ID column (chr_pos_ref_alt format):",
-                        choices=col_choices,
-                        default="(none)",
-                    ).ask()
-                    if sent_answer is None:
-                        raise SystemExit(0)
-                    if sent_answer != "(none)":
-                        sentinel_column = sent_answer
-
-                if pvalue_column is None:
-                    pval_answer = questionary.select(
-                        "P-value column:",
-                        choices=col_choices,
-                        default="(none)",
-                    ).ask()
-                    if pval_answer is None:
-                        raise SystemExit(0)
-                    if pval_answer != "(none)":
-                        pvalue_column = pval_answer
-
-                if rsid_column is None:
-                    rsid_answer = questionary.select(
-                        "rsID column:",
-                        choices=col_choices,
-                        default="(none)",
-                    ).ask()
-                    if rsid_answer is None:
-                        raise SystemExit(0)
-                    if rsid_answer != "(none)":
-                        rsid_column = rsid_answer
         if not traits_str:
             traits_str = questionary.text("Traits (comma-separated, e.g. FEV1,FVC):").ask()
             if traits_str is None:
@@ -1793,6 +2110,7 @@ def study_add(ctx, study_name, loci_file, loci_sheet, loci_skip, gene_column,
                 loci_skip=loci_skip,
                 window_kb=window_kb,
                 merge_distance_kb=merge_kb,
+                transformations=accepted_transforms or None,
                 cache_dir=root / ".v2f",
                 config_path=config_path,
                 report=report,

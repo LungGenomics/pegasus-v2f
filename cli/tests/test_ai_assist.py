@@ -7,10 +7,13 @@ import pandas as pd
 import pytest
 
 from pegasus_v2f.ai_assist import (
+    AIColumnSuggestion,
     AISuggestion,
     ClaudeCLIProvider,
     get_provider,
+    _build_column_prompt,
     _build_prompt,
+    _parse_column_response,
     _parse_response,
 )
 from pegasus_v2f.inspect import inspect_dataframe
@@ -33,7 +36,9 @@ GOOD_RESPONSE = json.dumps({
     "mappings": {"gene": "gene", "chromosome": "chr", "position": "pos", "score": "PP_H4_abf"},
     "centric": "variant",
     "quality_notes": ["Strip chr prefix for Ensembl compatibility"],
-    "normalization_suggestions": ["Strip 'chr' prefix from chromosome column"],
+    "transformations": [
+        {"type": "strip_prefix", "column": "chr", "prefix": "chr"},
+    ],
     "confidence": 0.92,
 })
 
@@ -45,6 +50,15 @@ class TestParseResponse:
         assert result.category == "COLOC"
         assert result.confidence == 0.92
         assert result.centric == "variant"
+        assert len(result.transformations) == 1
+        assert result.transformations[0]["type"] == "strip_prefix"
+
+    def test_no_transformations_field(self):
+        """Backwards-compatible: missing transformations defaults to empty list."""
+        resp = json.dumps({"category": "EXP", "reasoning": "test", "confidence": 0.8})
+        result = _parse_response(resp)
+        assert result is not None
+        assert result.transformations == []
 
     def test_json_in_markdown(self):
         text = f"Here's my analysis:\n```json\n{GOOD_RESPONSE}\n```\nDone."
@@ -84,6 +98,33 @@ class TestBuildPrompt:
         prompt = _build_prompt(sample_inspection)
         assert "JSON" in prompt
         assert "category" in prompt
+
+    def test_includes_transform_vocabulary(self, sample_inspection):
+        prompt = _build_prompt(sample_inspection)
+        assert "Available Transformations" in prompt
+        assert "strip_prefix" in prompt
+        assert "coerce_numeric" in prompt
+        assert "drop_nulls" in prompt
+        assert "uppercase" in prompt
+
+    def test_includes_heuristic_fixes(self, sample_inspection):
+        from pegasus_v2f.inspect import SuggestedFix
+        fixes = [SuggestedFix(
+            "strip_chr_prefix",
+            "Chr column has 'chr' prefix",
+            {"type": "strip_prefix", "column": "chr", "prefix": "chr"},
+        )]
+        prompt = _build_prompt(sample_inspection, heuristic_fixes=fixes)
+        assert "Heuristic Suggestions" in prompt
+        assert "strip_chr_prefix" in prompt
+
+    def test_no_heuristic_section_without_fixes(self, sample_inspection):
+        prompt = _build_prompt(sample_inspection)
+        assert "Heuristic Suggestions" not in prompt
+
+    def test_empty_heuristic_fixes(self, sample_inspection):
+        prompt = _build_prompt(sample_inspection, heuristic_fixes=[])
+        assert "Heuristic Suggestions" not in prompt
 
 
 class TestClaudeCLIProvider:
@@ -147,3 +188,97 @@ class TestGetProvider:
     def test_unknown_provider(self):
         provider = get_provider("unknown")
         assert provider is None
+
+
+class TestColumnDetection:
+    def test_build_column_prompt_sentinel(self):
+        cols = [
+            {"name": "CHROM_NUM", "dtype": "text", "sample_values": ["1", "2", "3"]},
+            {"name": "BP", "dtype": "numeric", "sample_values": ["1000000", "2000000"]},
+        ]
+        prompt = _build_column_prompt(cols, context="sentinel")
+        assert "CHROM_NUM" in prompt
+        assert "chromosome" in prompt
+        assert "position" in prompt
+
+    def test_build_column_prompt_source(self):
+        cols = [{"name": "GENE_SYM", "dtype": "text", "sample_values": ["AGER"]}]
+        prompt = _build_column_prompt(cols, context="source")
+        assert "gene" in prompt
+        assert "evidence" in prompt.lower()
+
+    def test_parse_column_response_clean_json(self):
+        text = '{"chromosome": "CHROM_NUM", "position": "BP"}'
+        result = _parse_column_response(text)
+        assert result is not None
+        assert result.mappings["chromosome"] == "CHROM_NUM"
+        assert result.mappings["position"] == "BP"
+
+    def test_parse_column_response_markdown(self):
+        text = '```json\n{"chromosome": "CHR", "gene": "NEAREST"}\n```'
+        result = _parse_column_response(text)
+        assert result is not None
+        assert result.mappings["chromosome"] == "CHR"
+
+    def test_parse_column_response_malformed(self):
+        result = _parse_column_response("I don't understand")
+        assert result is None
+
+    def test_parse_column_response_empty_dict(self):
+        result = _parse_column_response("{}")
+        assert result is not None
+        assert result.mappings == {}
+
+    def test_suggest_columns_with_mock(self, sample_inspection):
+        provider = ClaudeCLIProvider()
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '{"chromosome": "chr", "position": "pos", "gene": "gene"}'
+
+        with patch("subprocess.run", return_value=mock_result):
+            cols = [{"name": "chr", "sample_values": ["1"]}, {"name": "pos", "sample_values": ["1000"]}]
+            suggestion = provider.suggest_columns(cols, context="sentinel")
+            assert suggestion is not None
+            assert suggestion.mappings["chromosome"] == "chr"
+
+    def test_suggest_columns_timeout(self):
+        import subprocess
+        provider = ClaudeCLIProvider()
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("claude", 30)):
+            result = provider.suggest_columns([{"name": "x"}])
+            assert result is None
+
+
+class TestAISuggestionSerialization:
+    def test_to_dict_includes_transformations(self):
+        suggestion = AISuggestion(
+            category="COLOC",
+            category_reasoning="test",
+            column_mappings={"gene": "gene"},
+            centric="variant",
+            quality_notes=["note"],
+            transformations=[{"type": "strip_prefix", "column": "chr", "prefix": "chr"}],
+            confidence=0.9,
+        )
+        d = suggestion.to_dict()
+        assert "transformations" in d
+        assert len(d["transformations"]) == 1
+        assert d["transformations"][0]["type"] == "strip_prefix"
+        assert "normalization_suggestions" not in d
+
+    def test_suggest_passes_heuristic_fixes(self, sample_inspection):
+        """Verify heuristic_fixes are passed through to _build_prompt."""
+        from pegasus_v2f.inspect import SuggestedFix
+
+        fixes = [SuggestedFix("test_fix", "Test message", {"type": "uppercase", "column": "gene"})]
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = GOOD_RESPONSE
+
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            provider = ClaudeCLIProvider()
+            provider.suggest(sample_inspection, heuristic_fixes=fixes)
+            # Verify the prompt contains heuristic fix context
+            prompt_arg = mock_run.call_args[0][0][3]  # ["claude", "--print", "-p", prompt]
+            assert "Heuristic Suggestions" in prompt_arg
+            assert "test_fix" in prompt_arg
