@@ -16,10 +16,10 @@ click.rich_click.COMMAND_GROUPS = {
         {"name": "Query & Export", "commands": ["query", "config", "export"]},
     ],
     "v2f source": [
-        {"name": "Commands", "commands": ["list", "add", "show", "update", "remove"]},
+        {"name": "Commands", "commands": ["list", "inspect", "configure", "load", "show", "update", "remove"]},
     ],
     "v2f study": [
-        {"name": "Commands", "commands": ["list", "add", "inspect", "show", "preview", "set", "remove"]},
+        {"name": "Commands", "commands": ["list", "inspect", "configure", "load", "show", "preview", "set", "remove"]},
     ],
 }
 
@@ -68,7 +68,7 @@ def cli(ctx, db, project, json_output, quiet):
 # =====================================================================
 
     # NOTE: `v2f build` has been removed. Evidence is now loaded incrementally
-    # via `v2f source add`, loci via `v2f study add`, and scoring via `v2f rescore`.
+    # via `v2f source configure` + `v2f source load`, loci via `v2f study configure` + `v2f study load`, and scoring via `v2f rescore`.
     # The old monolithic build pipeline (pipeline.py) is retained for programmatic
     # use but is no longer exposed as a CLI command.
 
@@ -191,7 +191,7 @@ def sync(ctx, auto_build, push, message):
                     console.print(f"  {f}")
 
                 if result["config_changed"] and auto_build:
-                    console.print("\n[bold]Config changed — rebuilding...[/bold]")
+                    console.print("\n[bold]Config changed — building...[/bold]")
                     from pegasus_v2f.config import read_config
                     from pegasus_v2f.db import open_db
                     from pegasus_v2f.pipeline import build_db
@@ -301,10 +301,10 @@ def serve(ctx, port, host, reload):
 @cli.command()
 @handle_errors
 @click.pass_context
-def rebuild(ctx):
-    """Delete and rebuild the database from v2f.yaml config.
+def build(ctx):
+    """Build the database from v2f.yaml config.
 
-    Recreates the DB from scratch: schema, studies (with loci from stored
+    Creates the DB from scratch: schema, studies (with loci from stored
     loci_source), data sources, gene annotations, and scoring.
     """
     import logging
@@ -324,12 +324,12 @@ def rebuild(ctx):
     config = read_config(root)
 
     from pegasus_v2f.report import Report, render_report
-    report = Report(operation="rebuild")
+    report = Report(operation="build")
 
     conn = get_connection(db=db_arg, config=config, project_root=root)
     try:
         if has_tables(conn):
-            if not click.confirm("This will delete and rebuild the entire database. Continue?", default=False):
+            if not click.confirm("This will delete and build the database from scratch. Continue?", default=False):
                 raise SystemExit(0)
             drop_all_tables(conn)
 
@@ -376,7 +376,7 @@ def rebuild(ctx):
                 merge_distance_kb=locus_def.get("merge_distance_kb", 250),
                 transformations=study_cfg.get("transformations"),
                 cache_dir=root / ".v2f",
-                config_path=None,  # Don't re-write yaml during rebuild
+                config_path=None,  # Don't re-write yaml during build
                 report=study_report,
             )
             total_loci += result["n_loci"]
@@ -441,7 +441,7 @@ def rebuild(ctx):
 @handle_errors
 @click.pass_context
 def rescore(ctx):
-    """Re-run integration scoring (without full rebuild)."""
+    """Re-run integration scoring (without full build)."""
     import logging
     from pegasus_v2f.project import find_project_root
     from pegasus_v2f.config import read_config
@@ -505,7 +505,7 @@ def source_list(ctx):
         sources = src_mod.list_sources(conn)
 
     if not sources:
-        click.echo("No sources configured. Use 'v2f source add' to add one.")
+        click.echo("No sources configured. Use 'v2f source configure' to add one.")
         return
 
     console = Console()
@@ -520,653 +520,312 @@ def source_list(ctx):
     console.print(table)
 
 
-def _pick_column(label, col_names, default=None):
-    """Prompt user to select a column from a list."""
-    import questionary
-    result = questionary.select(f"{label}:", choices=col_names, default=default).ask()
-    if result is None:
-        raise SystemExit(0)
-    return result
-
-
-def _columns_from_preview(preview_df, skip_rows=0):
-    """Build column info dicts from a preview DataFrame (header=None format).
-
-    The preview DataFrame has integer column indices and the header text
-    lives in the row at index `skip_rows`.
-    """
-    import pandas as pd
-    if skip_rows < len(preview_df):
-        header_row = preview_df.iloc[skip_rows]
-        col_names = [str(v) if pd.notna(v) else f"col_{i}" for i, v in enumerate(header_row)]
-        data_rows = preview_df.iloc[skip_rows + 1:]
-    else:
-        col_names = [str(c) for c in preview_df.columns]
-        data_rows = preview_df
-
-    columns = []
-    for i, col in enumerate(col_names):
-        samples = []
-        for _, row in data_rows.head(3).iterrows():
-            val = row.iloc[i] if i < len(row) else None
-            if pd.notna(val):
-                samples.append(str(val))
-        col_type = "text"
-        if samples:
-            try:
-                [float(s) for s in samples]
-                col_type = "numeric"
-            except ValueError:
-                pass
-        columns.append({"name": col, "type": col_type, "sample_values": samples})
-    return columns
-
-
-def _confirm_column_mappings(proposals: dict, available_columns: list, *, label: str = "Detected") -> dict:
-    """Confirm column mappings: show summary, accept or edit per-column.
-
-    Works for both heuristic and AI-detected mappings.
-
-    Args:
-        proposals: role -> column_name (e.g. {"gene": "nearest_gene", "pvalue": "P/cP"})
-        available_columns: list of actual column names in the DataFrame
-        label: prefix for the display line (e.g. "Detected" or "AI")
-
-    Returns:
-        Accepted mappings: role -> column_name
-    """
-    import questionary
-
-    role_labels = {
-        "gene": "Nearest gene column",
-        "chromosome": "Chromosome column",
-        "position": "Position column",
-        "sentinel_id": "Sentinel variant ID column",
-        "pvalue": "P-value column",
-        "rsid": "rsID column",
-        "score": "Score column",
-        "effect_size": "Effect size column",
-    }
-
-    # Show one-line summary
-    summary = ", ".join(f"{r}: {c}" for r, c in proposals.items())
-    click.echo(f"\n  {label} column mappings: {{{summary}}}")
-
-    if click.confirm("  Accept?", default=True):
-        return dict(proposals)
-
-    # Per-column edit
-    col_choices = ["(none)"] + [str(c) for c in available_columns]
-    accepted = {}
-    for role, suggested in proposals.items():
-        role_label = role_labels.get(role, role)
-        default = suggested if suggested in col_choices else "(none)"
-        answer = questionary.select(
-            f"  {role_label}:",
-            choices=col_choices,
-            default=default,
-        ).ask()
-        if answer is None:
-            return accepted
-        if answer != "(none)":
-            accepted[role] = answer
-
-    return accepted
-
-
-def _ai_transforms_to_fixes(transformations):
-    """Convert AI-suggested transformation dicts to SuggestedFix objects."""
-    from pegasus_v2f.inspect import SuggestedFix
-
-    fixes = []
-    for t in transformations:
-        t_type = t.get("type", "unknown")
-        col = t.get("column", t.get("columns", "N/A"))
-        if isinstance(col, dict):
-            col = ", ".join(f"{k}->{v}" for k, v in col.items())
-        elif isinstance(col, list):
-            col = ", ".join(col)
-        fixes.append(SuggestedFix(
-            code=f"ai_{t_type}",
-            message=f"{t_type} on {col}",
-            transformation=t,
-        ))
-    return fixes
-
-
-def _apply_suggested_fixes(fixes):
-    """Prompt user to accept/skip suggested transformation fixes.
-
-    Returns list of accepted transformation dicts.
-    """
-    import questionary
-
-    actionable = [f for f in fixes if f.transformation is not None]
-    if not actionable:
-        return []
-
-    click.echo()
-    choice = questionary.select(
-        "Apply suggested transformations?",
-        choices=[
-            questionary.Choice("Accept all", value="a"),
-            questionary.Choice("Edit individually", value="e"),
-            questionary.Choice("Skip all", value="s"),
-        ],
-    ).ask()
-    if choice is None or choice == "s":
-        return []
-
-    if choice == "a":
-        return [f.transformation for f in actionable]
-
-    # Edit individually
-    accepted = []
-    for fix in actionable:
-        import json as _json
-        click.echo(f"\n  [{fix.code}] {fix.message}")
-        click.echo(f"  Transform: {_json.dumps(fix.transformation)}")
-        action = questionary.select(
-            "Action:",
-            choices=[
-                questionary.Choice("Accept", value="accept"),
-                questionary.Choice("Skip", value="skip"),
-            ],
-        ).ask()
-        if action == "accept":
-            accepted.append(fix.transformation)
-
-    return accepted
-
-
-def _build_evidence_blocks_interactive(source_name, preview_df, gene_column,
-                                       skip_rows, evidence_categories, ai_suggestion=None):
-    """Interactive wizard to build one or more evidence blocks.
-
-    Uses preview DataFrame to show columns, prompts for gene/chr/pos mapping,
-    then lets the user select evidence columns and configure each one.
-    """
-    import questionary
-    import re
-    from pegasus_v2f.integrate import suggest_mappings, validate_mapping, _NAME_CATEGORY_HINTS
+def _render_proposed_config(config: dict, entity_type: str, console=None) -> None:
+    """Render a proposed config block as YAML to stderr."""
+    import sys
+    import yaml
     from rich.console import Console
-    from rich.table import Table as RichTable
+    from rich.panel import Panel
+    from rich.syntax import Syntax
 
-    console = Console()
+    if console is None:
+        console = Console(stderr=True, file=sys.stderr)
 
-    columns = _columns_from_preview(preview_df, skip_rows)
-    suggestions = suggest_mappings(columns, source_name)
-    col_names = [c["name"] for c in columns]
-
-    # 1. Show columns
-    col_table = RichTable(title="Detected Columns")
-    col_table.add_column("Column", style="bold")
-    col_table.add_column("Type")
-    col_table.add_column("Sample Values")
-    for c in columns:
-        col_table.add_row(c["name"], c["type"], ", ".join(c["sample_values"][:3]))
-    console.print(col_table)
-
-    # 2. Pick gene column
-    gene_default = suggestions["fields"].get("gene", gene_column)
-    if gene_default not in col_names:
-        gene_default = None
-    gene_col = _pick_column("Gene column", col_names, default=gene_default)
-
-    # 3. Variant toggle
-    suggest_variant = suggestions["centric"] == "variant"
-    is_variant = questionary.confirm(
-        "Does this source include variant positions (chr/pos)?",
-        default=suggest_variant,
-    ).ask()
-    if is_variant is None:
-        raise SystemExit(0)
-
-    used_cols = {gene_col}
-    centric = "gene"
-    chr_col = None
-    pos_col = None
-    rsid_col = None
-
-    if is_variant:
-        centric = "variant"
-        # Pick chr column
-        chr_default = suggestions["fields"].get("chromosome")
-        if chr_default not in col_names:
-            chr_default = None
-        chr_col = _pick_column("Chromosome column", col_names, default=chr_default)
-        used_cols.add(chr_col)
-
-        # Pick pos column
-        pos_default = suggestions["fields"].get("position")
-        if pos_default not in col_names:
-            pos_default = None
-        pos_col = _pick_column("Position column", col_names, default=pos_default)
-        used_cols.add(pos_col)
-
-        # Optional rsid
-        rsid_default = suggestions["fields"].get("rsid")
-        if rsid_default in col_names:
-            use_rsid = questionary.confirm(
-                f"Use '{rsid_default}' as rsID column?", default=True
-            ).ask()
-            if use_rsid:
-                rsid_col = rsid_default
-                used_cols.add(rsid_col)
-
-    # 4. Select evidence columns
-    remaining = [c for c in col_names if c not in used_cols]
-    if not remaining:
-        click.echo("No remaining columns for evidence. Adding source without evidence.")
-        return None
-
-    selected = questionary.checkbox(
-        "Select columns to tag as evidence:",
-        choices=remaining,
-    ).ask()
-    if selected is None:
-        raise SystemExit(0)
-    if not selected:
-        click.echo("No evidence columns selected.")
-        return None
-
-    # 5. Per-column config — show category descriptions from profiles
-    from pegasus_v2f.pegasus_schema import EVIDENCE_CATEGORY_PROFILES
-    cats_sorted = sorted(evidence_categories.keys())
-    cat_choices = []
-    for c in cats_sorted:
-        profile = EVIDENCE_CATEGORY_PROFILES.get(c)
-        desc = f" ({profile.description[:50]})" if profile else ""
-        cat_choices.append(f"{c} — {evidence_categories[c]}{desc}")
-
-    # Try to guess category from source name (or AI suggestion)
-    suggested_cat = None
-    if ai_suggestion and ai_suggestion.category:
-        suggested_cat = ai_suggestion.category
-    else:
-        name_lower = source_name.lower()
-        for hint, cat in _NAME_CATEGORY_HINTS.items():
-            if hint in name_lower:
-                suggested_cat = cat
-                break
-
-    ev_blocks = []
-    for col in selected:
-        click.echo(f"\n--- Configuring column: [bold]{col}[/bold] ---")
-
-        # Category
-        cat_default = None
-        if suggested_cat:
-            cat_default = next((ch for ch in cat_choices if ch.startswith(f"{suggested_cat} — ")), None)
-        cat_answer = questionary.select(
-            f"Evidence category for '{col}':",
-            choices=cat_choices,
-            default=cat_default,
-        ).ask()
-        if cat_answer is None:
-            raise SystemExit(0)
-        category = cat_answer.split(" — ")[0]
-
-        # Field type
-        col_info = next((c for c in columns if c["name"] == col), None)
-        is_numeric = col_info and col_info["type"] == "numeric"
-        field_type_default = "score" if is_numeric else "presence"
-        field_type = questionary.select(
-            f"What does '{col}' represent?",
-            choices=["pvalue", "score", "effect_size", "presence"],
-            default=field_type_default,
-        ).ask()
-        if field_type is None:
-            raise SystemExit(0)
-
-        # Source tag
-        sanitized = re.sub(r"[^a-zA-Z0-9]", "_", col).strip("_").lower()
-        default_tag = f"{source_name}_{sanitized}"
-        tag = questionary.text(
-            f"Source tag for '{col}':",
-            default=default_tag,
-        ).ask()
-        if tag is None:
-            raise SystemExit(0)
-
-        # Build fields dict
-        fields = {"gene": gene_col, field_type: col}
-        if is_variant:
-            fields["chromosome"] = chr_col
-            fields["position"] = pos_col
-            if rsid_col:
-                fields["rsid"] = rsid_col
-
-        ev_blocks.append({
-            "source_tag": tag,
-            "category": category,
-            "centric": centric,
-            "fields": fields,
-        })
-
-    # 6. Optional traits (shared)
-    trait_input = questionary.text(
-        "Trait tags (comma-separated, or Enter to skip):",
-        default="",
-    ).ask()
-    if trait_input and trait_input.strip():
-        trait_list = [t.strip() for t in trait_input.split(",") if t.strip()]
-        for block in ev_blocks:
-            block["traits"] = trait_list
-
-    # 7. Summary + confirm
-    click.echo()
-    summary_table = RichTable(title="Evidence Blocks")
-    summary_table.add_column("Source Tag", style="bold")
-    summary_table.add_column("Category")
-    summary_table.add_column("Centric")
-    summary_table.add_column("Fields")
-    for block in ev_blocks:
-        fields_str = ", ".join(f"{k}={v}" for k, v in block["fields"].items())
-        summary_table.add_row(
-            block["source_tag"], block["category"], block["centric"], fields_str,
-        )
-    console.print(summary_table)
-
-    # Validate each block
-    all_errors = []
-    for block in ev_blocks:
-        errors = validate_mapping(block)
-        all_errors.extend(errors)
-    if all_errors:
-        for err in all_errors:
-            click.echo(f"  Validation error: {err}", err=True)
-        raise click.ClickException("Evidence validation failed. Fix the issues and try again.")
-
-    if not questionary.confirm("Proceed with these evidence blocks?", default=True).ask():
-        raise SystemExit(0)
-
-    return ev_blocks
+    yaml_str = yaml.dump(config, default_flow_style=False, sort_keys=False)
+    syntax = Syntax(yaml_str, "yaml", theme="monokai", word_wrap=True)
+    console.print(Panel(syntax, title=f"Proposed {entity_type} config", border_style="dim"))
 
 
-@source.command("add")
+@source.command("configure")
 @handle_errors
-@click.argument("name")
+@click.argument("data_file")
+@click.option("--name", default=None, help="Source name (defaults to filename stem).")
 @click.option("--type", "source_type", type=click.Choice(["googlesheets", "file", "excel", "url"]))
-@click.option("--url", default=None, help="Source URL (Google Sheets or remote file).")
-@click.option("--path", "file_path", default=None, help="Local file path.")
-@click.option("--sheet", default=None, help="Sheet/tab name (for Google Sheets or Excel with multiple sheets).")
-@click.option("--skip", "skip_rows", default=None, type=int, help="Rows to skip before header (skips preview).")
-@click.option("--gene-column", default="gene", help="Column containing gene symbols.")
+@click.option("--sheet", default=None, help="Sheet/tab name.")
+@click.option("--skip", "skip_rows", default=None, type=int, help="Rows to skip before header.")
+@click.option("--gene-column", default=None, help="Column containing gene symbols.")
+@click.option("--category", default=None, help="PEGASUS evidence category.")
+@click.option("--traits", default=None, help="Comma-separated trait tags.")
+@click.option("--centric", type=click.Choice(["gene", "variant"]), default=None)
+@click.option("--source-tag", default=None, help="Source tag identifier.")
 @click.option("--display-name", default=None, help="Human-readable display name.")
-@click.option("--category", default=None, help="PEGASUS evidence category (e.g. QTL, COLOC, GWAS).")
-@click.option("--traits", default=None, help="Comma-separated trait tags for this evidence.")
-@click.option("--source-tag", default=None, help="Source tag identifier (defaults to NAME).")
-@click.option("--centric", type=click.Choice(["gene", "variant"]), default=None, help="Evidence centric type.")
-@click.option("--no-score", is_flag=True, help="Skip auto-scoring (for batch operations).")
-@click.option("--force", is_flag=True, help="Replace source if it already exists.")
-@click.option("--evidence-json", default=None,
-    help="JSON list of evidence blocks (for multi-category non-interactive use).")
-@click.option("--ai", "use_ai", is_flag=True, help="Enable AI-assisted category suggestion.")
-@click.option("--transform-json", default=None, help="JSON list of transformations to apply (non-interactive).")
+@click.option("--transform-json", default=None, help="JSON list of transformations.")
+@click.option("--evidence-json", default=None, help="JSON list of evidence blocks (overrides auto-proposal).")
+@click.option("--force", is_flag=True, help="Overwrite existing config entry.")
+@click.option("--ai", "use_ai", is_flag=True, help="AI-assisted suggestions.")
+@click.option("--json", "json_output", is_flag=True, help="Output structured JSON.")
 @click.pass_context
-def source_add(ctx, name, source_type, url, file_path, sheet, skip_rows, gene_column,
-               display_name, category, traits, source_tag, centric, no_score, force,
-               evidence_json, use_ai, transform_json):
-    """Add a data source with evidence configuration.
+def source_configure(ctx, data_file, name, source_type, sheet, skip_rows, gene_column,
+                     category, traits, centric, source_tag, display_name, transform_json,
+                     evidence_json, force, use_ai, json_output):
+    """Propose config for a data source, validate, and write to v2f.yaml.
 
-    Shows a preview of the first rows so you can confirm which row is the
-    header. Then prompts for evidence category and trait tags (or use
-    --category, --traits, --centric to skip prompts).
+    DATA_FILE is a local file path or URL. Never touches the database.
     """
+    from pathlib import Path
     from pegasus_v2f.project import find_project_root
-    from pegasus_v2f.config import read_config
-    from pegasus_v2f.db import open_db
-    from pegasus_v2f import sources as src_mod
-    from pegasus_v2f.pegasus_schema import EVIDENCE_CATEGORIES
+    from pegasus_v2f.config import read_config, append_source_to_yaml, remove_source_from_yaml
+    from pegasus_v2f.loaders import load_source
+    from pegasus_v2f.propose import propose_source_config
+    from pegasus_v2f.validate import validate_source, render_validation
 
-    source_def = {"name": name, "source_type": source_type or "file"}
-    if url:
-        source_def["url"] = url
-    if file_path:
-        source_def["path"] = file_path
+    root = find_project_root(ctx.obj.get("project"))
+    if not root:
+        raise click.ClickException("Not in a v2f project (no v2f.yaml found)")
+
+    config_path = root / "v2f.yaml"
+    data_dir = root / "data" / "raw"
+    if not data_dir.exists():
+        data_dir = root
+
+    # Derive source name from filename if not provided
+    if not name:
+        name = Path(data_file).stem.replace(" ", "_").lower()
+
+    # Build source_def for loading
+    if not source_type:
+        if data_file.startswith("http"):
+            if "docs.google.com/spreadsheets" in data_file:
+                source_type = "googlesheets"
+            else:
+                source_type = "url"
+        elif data_file.endswith((".xlsx", ".xls")):
+            source_type = "excel"
+        else:
+            source_type = "file"
+
+    source_def: dict = {"name": name, "source_type": source_type}
+    if source_type in ("googlesheets", "url"):
+        source_def["url"] = data_file
+    else:
+        source_def["path"] = data_file
     if sheet:
         source_def["sheet"] = sheet
-    if gene_column != "gene":
-        source_def["gene_column"] = gene_column
-    if display_name:
-        source_def["display_name"] = display_name
-
-    db_arg = ctx.obj.get("db")
-    config = None
-    data_dir = None
-    root = find_project_root(ctx.obj.get("project"))
-    if root:
-        config = read_config(root)
-        data_dir = root / "data" / "raw"
-        if not data_dir.exists():
-            data_dir = root
-
-    # Check for duplicates before downloading/previewing
-    if not force:
-        try:
-            with open_db(db=db_arg, config=config, project_root=root) as conn:
-                existing = src_mod.list_sources(conn)
-                if any(s["name"] == name for s in existing):
-                    raise click.ClickException(f"Source '{name}' already exists. Use --force to replace it.")
-        except click.ClickException:
-            raise
-        except (FileNotFoundError, OSError):
-            pass  # DB might not exist yet, that's fine
-
-    # Preview: always show so the user can verify the header
-    import pandas as pd
-    from pegasus_v2f.loaders import preview_source
-    from rich.console import Console
-    from rich.table import Table as RichTable
-
-    console = Console()
-    is_gsheet = (source_def.get("source_type") == "googlesheets")
-
-    # Fetch enough rows to show the header when skip is large
-    n_preview = max(10, (skip_rows or 0) + 2)
-
-    try:
-        if is_gsheet:
-            with console.status("Downloading spreadsheet..."):
-                preview = preview_source(source_def, data_dir=data_dir, n_rows=n_preview)
-        else:
-            preview = preview_source(source_def, data_dir=data_dir, n_rows=n_preview)
-    except Exception as e:
-        raise click.ClickException(f"Could not fetch preview: {e}")
-
-    table = RichTable(title=f"Preview: {name}", show_header=False)
-    table.add_column("Row", style="dim", width=4)
-    for col_idx in range(min(len(preview.columns), 6)):
-        table.add_column(f"Col {col_idx}", overflow="ellipsis", max_width=30)
-
-    for i, row in preview.iterrows():
-        vals = [str(v) if pd.notna(v) else "" for v in row.values[:6]]
-        style = "bold green" if skip_rows is not None and i == skip_rows else None
-        table.add_row(str(i), *vals, style=style)
-
-    console.print(table)
-
-    if len(preview.columns) > 6:
-        click.echo(f"  ... and {len(preview.columns) - 6} more columns")
-
-    if skip_rows is None:
-        skip_rows = click.prompt(
-            "\nWhich row is the header? (rows above it will be skipped)",
-            type=int,
-            default=0,
-        )
-    elif category is None and evidence_json is None:
-        # Only confirm interactively when not in non-interactive mode
-        click.echo(f"\nHeader row: {skip_rows}")
-        if not click.confirm("Proceed?", default=True):
-            raise SystemExit(0)
-
-    if skip_rows:
+    if skip_rows is not None:
         source_def["skip_rows"] = skip_rows
+    if gene_column:
+        source_def["gene_column"] = gene_column
 
-    # --- Transforms: non-interactive (--transform-json) ---
+    # Load data
+    try:
+        df = load_source(source_def, data_dir=data_dir)
+    except Exception as e:
+        raise click.ClickException(f"Could not load data: {e}")
+
+    # Parse transform-json
     if transform_json:
         import json as _json
         try:
             transforms = _json.loads(transform_json)
         except _json.JSONDecodeError as e:
             raise click.ClickException(f"Invalid --transform-json: {e}")
-        if not isinstance(transforms, list):
-            raise click.ClickException("--transform-json must be a JSON list")
-        source_def.setdefault("transformations", []).extend(transforms)
+        source_def["transformations"] = transforms
 
-    # --- Pre-wizard inspection + AI + fix suggestions ---
+    # AI suggestion
     ai_suggestion = None
-    if category is None and evidence_json is None and not transform_json:
-        # Interactive mode — run inspection before wizard
-        from pegasus_v2f.loaders import load_source
-        from pegasus_v2f.inspect import inspect_dataframe, render_inspection
+    if use_ai:
+        from pegasus_v2f.ai_assist import get_provider
+        from pegasus_v2f.inspect import inspect_dataframe
+        provider = get_provider("auto")
+        if provider:
+            inspection_for_ai = inspect_dataframe(df, source_name=name)
+            ai_suggestion = provider.suggest(inspection_for_ai, heuristic_fixes=inspection_for_ai.suggested_fixes)
 
-        try:
-            inspect_df = load_source(source_def, data_dir=data_dir)
-            inspection = inspect_dataframe(inspect_df, source_name=name)
-            render_inspection(inspection)
-
-            # Column mapping confirmation + transformations
-            if use_ai:
-                ai_suggestion = _show_ai_suggestion(
-                    inspection, heuristic_fixes=inspection.suggested_fixes,
-                )
-                if ai_suggestion and ai_suggestion.column_mappings:
-                    accepted_cols = _confirm_column_mappings(
-                        ai_suggestion.column_mappings, inspect_df.columns.tolist(),
-                        label="AI",
-                    )
-                    if not gene_column and accepted_cols.get("gene"):
-                        gene_column = accepted_cols["gene"]
-
-                if ai_suggestion and ai_suggestion.transformations:
-                    ai_fixes = _ai_transforms_to_fixes(ai_suggestion.transformations)
-                    accepted_transforms = _apply_suggested_fixes(ai_fixes)
-                    if accepted_transforms:
-                        source_def.setdefault("transformations", []).extend(accepted_transforms)
-                elif inspection.suggested_fixes:
-                    accepted_transforms = _apply_suggested_fixes(inspection.suggested_fixes)
-                    if accepted_transforms:
-                        source_def.setdefault("transformations", []).extend(accepted_transforms)
-            else:
-                # Heuristic mode — confirm detected mappings
-                if inspection.suggested_mappings:
-                    accepted_cols = _confirm_column_mappings(
-                        inspection.suggested_mappings, inspect_df.columns.tolist(),
-                        label="Detected",
-                    )
-                    if not gene_column and accepted_cols.get("gene"):
-                        gene_column = accepted_cols["gene"]
-
-                if inspection.suggested_fixes:
-                    accepted_transforms = _apply_suggested_fixes(inspection.suggested_fixes)
-                    if accepted_transforms:
-                        source_def.setdefault("transformations", []).extend(accepted_transforms)
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as e:
-            click.echo(f"  Inspection skipped: {e}", err=True)
-
-    # --- Evidence configuration ---
-    if category is not None:
-        # Non-interactive single-category (--category flag)
-        trait_list = None
-        if traits:
-            trait_list = [t.strip() for t in traits.split(",") if t.strip()]
-        # load_source renames gene_column -> "gene", so fields always reference "gene"
-        ev_block = {
-            "source_tag": source_tag or name,
-            "category": category,
-            "centric": centric or "gene",
-            "fields": {"gene": "gene"},
-        }
-        if trait_list:
-            ev_block["traits"] = trait_list
-        source_def["evidence"] = [ev_block]
-    elif evidence_json is not None:
-        # Non-interactive multi-category (--evidence-json flag)
+    # Parse evidence-json
+    explicit_evidence = None
+    if evidence_json:
         import json as _json
         try:
-            ev_blocks = _json.loads(evidence_json)
+            explicit_evidence = _json.loads(evidence_json)
         except _json.JSONDecodeError as e:
             raise click.ClickException(f"Invalid --evidence-json: {e}")
-        if not isinstance(ev_blocks, list) or not ev_blocks:
-            raise click.ClickException("--evidence-json must be a non-empty JSON list")
-        for block in ev_blocks:
-            if "centric" not in block:
-                fields = block.get("fields", {})
-                block["centric"] = "variant" if ("chromosome" in fields and "position" in fields) else "gene"
-        source_def["evidence"] = ev_blocks
+
+    # Propose config
+    proposed, inspection = propose_source_config(
+        df, name, source_def,
+        ai_suggestion=ai_suggestion,
+        gene_column=gene_column,
+        category=category,
+        traits=traits,
+        centric=centric,
+        source_tag=source_tag,
+    )
+
+    # Override evidence blocks if explicitly provided
+    if explicit_evidence is not None:
+        proposed["evidence"] = explicit_evidence
+
+    # Set display name if provided
+    if display_name:
+        proposed["display_name"] = display_name
+
+    # Validate
+    validation = validate_source(proposed, data_dir=data_dir, df=df)
+
+    is_json = json_output or ctx.obj.get("json_output")
+
+    if not is_json:
+        # Render results
+        from pegasus_v2f.inspect import render_inspection
+        render_inspection(inspection)
+        _render_proposed_config(proposed, "source")
+        render_validation(validation)
+
+    if not validation.is_valid:
+        if is_json:
+            import json as _json
+            print(_json.dumps({
+                "error": "validation_failed",
+                "proposed_config": proposed,
+                "validation": validation.to_dict(),
+            }, indent=2))
+        raise click.ClickException("Config not written. Fix errors and re-run.")
+
+    # Check for existing entry
+    config = read_config(root)
+    existing = [s for s in config.get("data_sources", []) if s["name"] == name]
+    if existing and not force:
+        raise click.ClickException(f"Source '{name}' already in v2f.yaml. Use --force to replace.")
+
+    # Write to v2f.yaml
+    if existing and force:
+        remove_source_from_yaml(config_path, name)
+    append_source_to_yaml(config_path, proposed)
+
+    if is_json:
+        import json as _json
+        output = {
+            "proposed_config": proposed,
+            "validation": validation.to_dict(),
+            "inspection": inspection.to_dict(),
+            "written": True,
+        }
+        print(_json.dumps(output, indent=2))
     else:
-        # Interactive wizard
-        ev_blocks = _build_evidence_blocks_interactive(name, preview, gene_column,
-                                                       skip_rows or 0, EVIDENCE_CATEGORIES,
-                                                       ai_suggestion=ai_suggestion)
-        if ev_blocks:
-            source_def["evidence"] = ev_blocks
+        click.echo(f"Wrote config for source '{name}' to v2f.yaml")
 
+
+@source.command("load")
+@handle_errors
+@click.argument("name")
+@click.option("--force", is_flag=True, help="Replace existing DB entry.")
+@click.option("--no-score", is_flag=True, help="Skip auto-scoring.")
+@click.option("-y", "--yes", is_flag=True, help="Skip confirmation.")
+@click.option("--json", "json_output", is_flag=True, help="Output structured JSON.")
+@click.pass_context
+def source_load(ctx, name, force, no_score, yes, json_output):
+    """Load a configured source from v2f.yaml into the database.
+
+    Reads the source config by NAME, validates against data, then loads.
+    """
+    from pegasus_v2f.project import find_project_root
+    from pegasus_v2f.config import read_config, get_data_sources
+    from pegasus_v2f.db import open_db
+    from pegasus_v2f import sources as src_mod
+    from pegasus_v2f.validate import validate_source, render_validation
+
+    root = find_project_root(ctx.obj.get("project"))
+    if not root:
+        raise click.ClickException("Not in a v2f project (no v2f.yaml found)")
+
+    config = read_config(root)
+    sources = get_data_sources(config)
+    source_config = next((s for s in sources if s["name"] == name), None)
+    if not source_config:
+        raise click.ClickException(f"Source '{name}' not found in v2f.yaml")
+
+    data_dir = root / "data" / "raw"
+    if not data_dir.exists():
+        data_dir = root
+
+    # Validate before loading
+    validation = validate_source(source_config, data_dir=data_dir)
+
+    if json_output or ctx.obj.get("json_output"):
+        import json as _json
+        if not validation.is_valid:
+            print(_json.dumps({"error": "validation_failed", "validation": validation.to_dict()}, indent=2))
+            raise click.ClickException("Validation failed. Fix errors and re-run.")
+        # Continue to load and output result as JSON below
+    else:
+        render_validation(validation)
+
+    if not validation.is_valid:
+        raise click.ClickException("Config not loaded. Fix errors and re-run.")
+
+    if not yes and not json_output:
+        if not click.confirm(f"Load source '{name}' into database?", default=True):
+            raise SystemExit(0)
+
+    db_arg = ctx.obj.get("db")
     from pegasus_v2f.report import Report, render_report
-
-    report = Report(operation="source_add")
+    report = Report(operation="source_load")
 
     try:
         with open_db(db=db_arg, config=config, project_root=root) as conn:
+            from pegasus_v2f.pegasus_schema import create_pegasus_schema
+            create_pegasus_schema(conn)
             if force:
                 try:
                     src_mod.remove_source(conn, name, config=config)
                 except ValueError:
-                    pass  # Source didn't exist, that's fine
-            rows = src_mod.add_source(conn, source_def, data_dir=data_dir, config=config,
+                    pass
+            rows = src_mod.add_source(conn, source_config, data_dir=data_dir, config=config,
                                       no_score=no_score, report=report)
     except (ValueError, FileNotFoundError) as e:
         raise click.ClickException(str(e))
 
-    # Write source to v2f.yaml so file config stays in sync with DB
-    if root:
-        from pegasus_v2f.config import append_source_to_yaml, remove_source_from_yaml
-        config_path = root / "v2f.yaml"
-        if config_path.exists():
-            if force:
-                remove_source_from_yaml(config_path, name)
-            append_source_to_yaml(config_path, source_def)
-
-    click.echo(f"Added source '{name}': {rows} rows")
-    if ctx.obj.get("json_output"):
-        render_report(report, json_mode=True)
-    elif report.has_warnings:
-        render_report(report)
+    if json_output or ctx.obj.get("json_output"):
+        import json as _json
+        print(_json.dumps({"name": name, "rows": rows, "validation": validation.to_dict()}, indent=2))
+    else:
+        click.echo(f"Loaded source '{name}': {rows} rows")
+        if report.has_warnings:
+            render_report(report)
 
 
 @source.command("inspect")
 @handle_errors
-@click.argument("name")
+@click.argument("data_file")
+@click.option("--name", default=None, help="Source name (defaults to filename stem).")
 @click.option("--type", "source_type", type=click.Choice(["googlesheets", "file", "excel", "url"]))
-@click.option("--url", default=None, help="Source URL.")
-@click.option("--path", "file_path", default=None, help="Local file path.")
 @click.option("--sheet", default=None, help="Sheet/tab name.")
 @click.option("--skip", "skip_rows", default=None, type=int, help="Rows to skip before header.")
 @click.option("--ai", "use_ai", is_flag=True, help="Enable AI-assisted category suggestion.")
 @click.option("--json", "json_output", is_flag=True, help="Output structured JSON.")
 @click.pass_context
-def source_inspect(ctx, name, source_type, url, file_path, sheet, skip_rows, use_ai, json_output):
-    """Inspect a data source for PEGASUS compatibility before loading.
+def source_inspect(ctx, data_file, name, source_type, sheet, skip_rows, use_ai, json_output):
+    """Inspect a data source for PEGASUS compatibility (read-only).
 
-    Profiles columns, validates gene symbols, checks chromosome formats,
-    and suggests evidence category mappings. Use --ai for AI-assisted
-    category detection via claude CLI.
+    Shows data profile AND a proposed config block. No side effects.
+    DATA_FILE is a local file path or URL.
     """
+    from pathlib import Path
     from pegasus_v2f.project import find_project_root
-    from pegasus_v2f.config import read_config
     from pegasus_v2f.loaders import load_source
     from pegasus_v2f.inspect import inspect_dataframe, render_inspection
+    from pegasus_v2f.propose import propose_source_config
 
-    source_def = {"name": name, "source_type": source_type or "file"}
-    if url:
-        source_def["url"] = url
-    if file_path:
-        source_def["path"] = file_path
+    if not name:
+        name = Path(data_file).stem.replace(" ", "_").lower()
+
+    # Auto-detect source type
+    if not source_type:
+        if data_file.startswith("http"):
+            if "docs.google.com/spreadsheets" in data_file:
+                source_type = "googlesheets"
+            else:
+                source_type = "url"
+        elif data_file.endswith((".xlsx", ".xls")):
+            source_type = "excel"
+        else:
+            source_type = "file"
+
+    source_def: dict = {"name": name, "source_type": source_type}
+    if source_type in ("googlesheets", "url"):
+        source_def["url"] = data_file
+    else:
+        source_def["path"] = data_file
     if sheet:
         source_def["sheet"] = sheet
     if skip_rows:
@@ -1180,7 +839,7 @@ def source_inspect(ctx, name, source_type, url, file_path, sheet, skip_rows, use
             data_dir = root
 
     try:
-        if url:
+        if data_file.startswith("http"):
             from rich.console import Console
             console = Console(stderr=True)
             with console.status("Downloading source..."):
@@ -1190,60 +849,54 @@ def source_inspect(ctx, name, source_type, url, file_path, sheet, skip_rows, use
     except Exception as e:
         raise click.ClickException(f"Could not load source: {e}")
 
-    result = inspect_dataframe(df, source_name=name)
+    # AI suggestion
+    ai_suggestion = None
+    if use_ai:
+        from pegasus_v2f.ai_assist import get_provider
+        provider = get_provider("auto")
+        if provider:
+            inspection_for_ai = inspect_dataframe(df, source_name=name)
+            ai_suggestion = provider.suggest(inspection_for_ai, heuristic_fixes=inspection_for_ai.suggested_fixes)
+            if not ai_suggestion:
+                click.echo("AI suggestion failed — showing heuristic only.", err=True)
+        else:
+            click.echo("AI provider not available (claude CLI not found).", err=True)
+
+    # Propose config (includes inspection)
+    proposed, inspection = propose_source_config(
+        df, name, source_def, ai_suggestion=ai_suggestion,
+    )
 
     if json_output or ctx.obj.get("json_output"):
         import json as _json
-        output = result.to_dict()
-        # AI section added below if applicable
-        if use_ai:
-            from pegasus_v2f.ai_assist import get_provider
-            provider = get_provider("auto")
-            if provider:
-                suggestion = provider.suggest(result, heuristic_fixes=result.suggested_fixes)
-                if suggestion:
-                    output["ai_suggestion"] = suggestion.to_dict()
-                else:
-                    click.echo("AI suggestion failed — showing inspection only.", err=True)
-            else:
-                click.echo("AI provider not available (claude CLI not found).", err=True)
+        output = inspection.to_dict()
+        output["proposed_config"] = proposed
+        if ai_suggestion:
+            output["ai_suggestion"] = ai_suggestion.to_dict()
         print(_json.dumps(output, indent=2))
         return
 
-    render_inspection(result)
+    render_inspection(inspection)
+    _render_proposed_config(proposed, "source")
 
-    if use_ai:
-        _show_ai_suggestion(result, heuristic_fixes=result.suggested_fixes)
+    if use_ai and ai_suggestion:
+        _show_ai_suggestion_display(ai_suggestion)
 
 
-def _show_ai_suggestion(result, *, heuristic_fixes=None):
-    """Run AI provider and display suggestion. Gracefully degrades on failure.
-
-    When heuristic_fixes is provided, passes them to the AI so it can
-    produce authoritative structured transformations.
-    """
-    from pegasus_v2f.ai_assist import get_provider
+def _show_ai_suggestion_display(suggestion):
+    """Display an AI suggestion (non-interactive)."""
     from pegasus_v2f.pegasus_schema import EVIDENCE_CATEGORIES
     from rich.console import Console
     import sys
 
     console = Console(stderr=True, file=sys.stderr)
-    provider = get_provider("auto")
-    if not provider:
-        console.print("  [yellow]AI provider not available (claude CLI not found)[/yellow]\n")
-        return None
 
-    console.print(f"\n  [dim]Running AI analysis ({provider.name})...[/dim]")
-    suggestion = provider.suggest(result, heuristic_fixes=heuristic_fixes)
-    if not suggestion:
-        console.print("  [yellow]AI suggestion failed — continuing without AI[/yellow]\n")
-        return None
-
-    console.print(f"\n  [bold]AI Analysis[/bold] ({provider.name})")
+    console.print(f"\n  [bold]AI Analysis[/bold]")
     if suggestion.category:
         label = EVIDENCE_CATEGORIES.get(suggestion.category, "")
         console.print(f"    Category: [bold]{suggestion.category}[/bold] ({label})")
-    console.print(f"    \"{suggestion.category_reasoning}\"")
+    if suggestion.category_reasoning:
+        console.print(f"    \"{suggestion.category_reasoning}\"")
     if suggestion.column_mappings:
         mappings_str = ", ".join(f"{k}->{v}" for k, v in suggestion.column_mappings.items())
         console.print(f"    Mappings: {mappings_str}")
@@ -1262,8 +915,6 @@ def _show_ai_suggestion(result, *, heuristic_fixes=None):
                 col = ", ".join(col)
             console.print(f"    - {t['type']} on {col}")
     console.print(f"    Confidence: {suggestion.confidence:.0%}\n")
-
-    return suggestion
 
 
 @source.command("show")
@@ -1585,7 +1236,7 @@ def study_list(ctx):
     studies = get_study_list(config)
 
     if not studies:
-        click.echo("No studies configured. Use 'v2f study add' to create one.")
+        click.echo("No studies configured. Use 'v2f study configure' to create one.")
         return
 
     console = Console()
@@ -1690,8 +1341,8 @@ def study_inspect(ctx, loci_file, sheet, skip_rows, window_kb, merge_kb,
 
     label = sheet or loci_file.rstrip("/").split("/")[-1] or loci_file
 
-    # AI-first column detection: if --ai is set and key columns weren't
-    # specified explicitly, try AI to detect unusual column names
+    # AI suggestion (used for both column detection and proposed config)
+    ai_suggestion = None
     if use_ai and not (chr_column and pos_column):
         from pegasus_v2f.ai_assist import get_provider
         from pegasus_v2f.study_inspect import _detect_sentinel_columns
@@ -1752,427 +1403,331 @@ def study_inspect(ctx, loci_file, sheet, skip_rows, window_kb, merge_kb,
             err=True,
         )
 
+    # Generate proposed config for display
+    from pegasus_v2f.propose import propose_study_config
+    label = sheet or loci_file.rstrip("/").split("/")[-1] or loci_file
+    study_name = Path(loci_file).stem.replace(" ", "_").lower() if not loci_file.startswith("http") else label
+
+    # Build a proposed config (with placeholder traits since inspect is read-only)
+    det = result.column_detection
+    proposed, _ = propose_study_config(
+        loci_df, study_name, ["<TRAIT>"],
+        loci_source=loci_file,
+        loci_sheet=sheet,
+        loci_skip=skip_rows,
+        window_kb=window_kb,
+        merge_distance_kb=merge_kb,
+        cache_dir=cache_dir,
+        gene_column=gene_column or det.gene,
+        sentinel_column=sentinel_column or det.sentinel_id,
+        pvalue_column=pvalue_column or det.pvalue,
+        rsid_column=rsid_column or det.rsid,
+        ai_suggestion=ai_suggestion,
+    )
+
     if json_output or ctx.obj.get("json_output"):
         import json as _json
-
         output = result.to_dict()
-        if use_ai:
-            from pegasus_v2f.ai_assist import get_provider
-
-            provider = get_provider("auto")
-            if provider:
-                suggestion = provider.suggest(result, heuristic_fixes=result.suggested_fixes)
-                if suggestion:
-                    output["ai_suggestion"] = suggestion.to_dict()
-                else:
-                    click.echo("AI suggestion failed — showing inspection only.", err=True)
-            else:
-                click.echo("AI provider not available (claude CLI not found).", err=True)
+        output["proposed_config"] = proposed
+        if ai_suggestion:
+            output["ai_suggestion"] = ai_suggestion.to_dict()
         print(_json.dumps(output, indent=2))
         return
 
     render_study_inspection(result)
+    _render_proposed_config(proposed, "study")
 
-    if use_ai:
-        _show_ai_suggestion(result, heuristic_fixes=result.suggested_fixes)
+    if use_ai and ai_suggestion:
+        _show_ai_suggestion_display(ai_suggestion)
 
 
-@study.command("add")
+@study.command("configure")
 @handle_errors
-@click.argument("study_name", required=False)
-@click.option("--loci", "loci_file", default=None, help="Sentinel variant file (local path or Google Sheets URL).")
-@click.option("--sheet", "loci_sheet", default=None, help="Sheet/tab name (for Excel or Google Sheets with multiple tabs).")
-@click.option("--skip", "loci_skip", default=None, type=int, help="Rows to skip before header in loci file.")
-@click.option("--gene-column", default=None, help="Column with nearest gene per sentinel (stored on loci, not scored).")
-@click.option("--sentinel-column", default=None, help="Column with variant ID (chr_pos_ref_alt format, any separator).")
-@click.option("--pvalue-column", default=None, help="Column with p-value per sentinel.")
-@click.option("--rsid-column", default=None, help="Column with rsID per sentinel.")
-@click.option("--traits", "traits_str", help="Comma-separated trait names")
-@click.option("--gwas-source", help="GWAS source (PMID or GCST)")
-@click.option("--ancestry", help="Population ancestry")
-@click.option("--sex", help="Sex restriction (male/female/both)")
-@click.option("--sample-size", type=int, help="GWAS sample size")
-@click.option("--doi", help="Publication DOI")
-@click.option("--year", type=int, help="Publication year")
-@click.option("--window-kb", type=int, default=500, help="Locus window half-size in kb (default: 500)")
-@click.option("--merge-kb", type=int, default=250, help="Merge distance in kb (default: 250)")
-@click.option("--force", is_flag=True, help="Replace study if it already exists.")
-@click.option("--ai", "use_ai", is_flag=True, help="AI-assisted inspection and transformations before adding.")
-@click.option("--transform-json", help="JSON list of transformations to apply (non-interactive).")
+@click.argument("loci_file")
+@click.option("--name", default=None, help="Study name (defaults to filename stem).")
+@click.option("--traits", "traits_str", required=True, help="Comma-separated trait names.")
+@click.option("--sheet", "loci_sheet", default=None, help="Sheet/tab name.")
+@click.option("--skip", "loci_skip", default=None, type=int, help="Rows to skip before header.")
+@click.option("--gene-column", default=None, help="Gene column name.")
+@click.option("--sentinel-column", default=None, help="Variant ID column name.")
+@click.option("--pvalue-column", default=None, help="P-value column name.")
+@click.option("--rsid-column", default=None, help="rsID column name.")
+@click.option("--gwas-source", default=None, help="GWAS source (PMID or GCST).")
+@click.option("--ancestry", default=None, help="Population ancestry.")
+@click.option("--sex", default=None, help="Sex restriction.")
+@click.option("--sample-size", type=int, default=None, help="GWAS sample size.")
+@click.option("--doi", default=None, help="Publication DOI.")
+@click.option("--year", type=int, default=None, help="Publication year.")
+@click.option("--window-kb", type=int, default=500, help="Locus window half-size in kb.")
+@click.option("--merge-kb", type=int, default=250, help="Merge distance in kb.")
+@click.option("--transform-json", default=None, help="JSON list of transformations.")
+@click.option("--force", is_flag=True, help="Overwrite existing config entry.")
+@click.option("--ai", "use_ai", is_flag=True, help="AI-assisted suggestions.")
+@click.option("--json", "json_output", is_flag=True, help="Output structured JSON.")
 @click.pass_context
-def study_add(ctx, study_name, loci_file, loci_sheet, loci_skip, gene_column,
-              sentinel_column, pvalue_column, rsid_column,
-              traits_str, gwas_source, ancestry,
-              sex, sample_size, doi, year, window_kb, merge_kb, force, use_ai,
-              transform_json):
-    """Add a new study with loci from a sentinel variant file.
+def study_configure(ctx, loci_file, name, traits_str, loci_sheet, loci_skip,
+                    gene_column, sentinel_column, pvalue_column, rsid_column,
+                    gwas_source, ancestry, sex, sample_size, doi, year,
+                    window_kb, merge_kb, transform_json, force, use_ai, json_output):
+    """Propose config for a study, validate, and write to v2f.yaml.
 
-    If STUDY_NAME, --loci, and --traits are provided, runs non-interactively.
-    Otherwise, prompts for missing values. --loci accepts a local file path
-    or a Google Sheets URL.
+    LOCI_FILE is a local file path or URL. --traits is required.
+    Never touches the database.
     """
     from pathlib import Path
+    import pandas as pd
     from pegasus_v2f.project import find_project_root
-    from pegasus_v2f.config import read_config, add_study_to_yaml
-    from pegasus_v2f.db import get_connection
+    from pegasus_v2f.config import read_config, add_study_to_yaml, remove_study_from_yaml, get_study_list
+    from pegasus_v2f.propose import propose_study_config
+    from pegasus_v2f.validate import validate_study, render_validation
+    from pegasus_v2f.study_inspect import render_study_inspection
 
     root = find_project_root(ctx.obj.get("project"))
     if not root:
         raise click.ClickException("Not in a v2f project (no v2f.yaml found)")
 
     config_path = root / "v2f.yaml"
+    cache_dir = root / ".v2f"
 
-    import pandas as pd
-    from rich.console import Console
-    from rich.table import Table as RichTable
-    console = Console()
-
-    # Interactive: prompt for study name first (needed for context)
-    interactive = not study_name or not traits_str
-    if interactive:
-        import questionary
-        if not study_name:
-            study_name = questionary.text("Study name (e.g. shrine_2023):").ask()
-            if study_name is None:
-                raise SystemExit(0)
-        if not loci_file:
-            loci_path_input = questionary.path("Sentinel variant file (local path or Google Sheets URL):").ask()
-            if loci_path_input is None:
-                raise SystemExit(0)
-            loci_file = loci_path_input
-
-    # --- Check for existing study (before downloading anything) ---
-    config = read_config(root)
-    db_arg = ctx.obj.get("db")
-    conn = get_connection(db=db_arg, config=config, project_root=root)
-    try:
-        from pegasus_v2f.pegasus_schema import create_pegasus_schema
-        create_pegasus_schema(conn)
-        existing = conn.execute(
-            "SELECT COUNT(*) FROM studies WHERE study_name = ?", [study_name]
-        ).fetchone()[0]
-    finally:
-        conn.close()
-
-    if existing > 0:
-        if force:
-            from pegasus_v2f.study_management import remove_study as _remove_study
-            conn = get_connection(db=db_arg, config=config, project_root=root)
-            try:
-                _remove_study(conn, study_name)
-            finally:
-                conn.close()
-            from pegasus_v2f.config import remove_study_from_yaml
-            try:
-                remove_study_from_yaml(config_path, study_name)
-            except ValueError:
-                pass
-            click.echo(f"Removed existing study '{study_name}'")
-        else:
-            raise click.ClickException(
-                f"Study '{study_name}' already exists. Use --force to replace it."
-            )
-
-    # --- Loci preview + loading (before remaining prompts) ---
-    loci_df = None
-    loci_path = None
-    if loci_file:
+    # Derive study name
+    if not name:
         if loci_file.startswith("http"):
-            from pegasus_v2f.loaders import load_googlesheets, preview_source
-            source_spec = {"url": loci_file, "source_type": "googlesheets"}
-            if loci_sheet:
-                source_spec["sheet"] = loci_sheet
-
-            n_preview = max(10, (loci_skip or 0) + 2)
-            try:
-                with console.status("Downloading spreadsheet..."):
-                    preview = preview_source(source_spec, n_rows=n_preview)
-            except Exception as e:
-                raise click.ClickException(f"Could not fetch preview: {e}")
-
-            table = RichTable(title=f"Loci preview: {loci_sheet or 'default sheet'}", show_header=False)
-            table.add_column("Row", style="dim", width=4)
-            for col_idx in range(min(len(preview.columns), 6)):
-                table.add_column(f"Col {col_idx}", overflow="ellipsis", max_width=30)
-            for i, row in preview.iterrows():
-                vals = [str(v) if pd.notna(v) else "" for v in row.values[:6]]
-                style = "bold green" if loci_skip is not None and i == loci_skip else None
-                table.add_row(str(i), *vals, style=style)
-            console.print(table)
-            if len(preview.columns) > 6:
-                click.echo(f"  ... and {len(preview.columns) - 6} more columns")
-
-            if loci_skip is None:
-                loci_skip = click.prompt(
-                    "\nWhich row is the header? (rows above it will be skipped)",
-                    type=int, default=0,
-                )
-            else:
-                click.echo(f"\nHeader row: {loci_skip}")
-                if not click.confirm("Proceed?", default=True):
-                    raise SystemExit(0)
-
-            if loci_skip:
-                source_spec["skip_rows"] = loci_skip
-            loci_df = load_googlesheets(source_spec)
+            name = "study"
         else:
-            loci_path = Path(loci_file)
-            if not loci_path.exists():
-                raise click.ClickException(f"Loci file not found: {loci_path}")
-
-            if loci_path.suffix.lower() in (".xlsx", ".xls"):
-                from pegasus_v2f.loaders import preview_source
-                source_spec = {"path": str(loci_path), "source_type": "excel"}
-                if loci_sheet:
-                    source_spec["sheet"] = loci_sheet
-
-                n_preview = max(10, (loci_skip or 0) + 2)
-                try:
-                    preview = preview_source(source_spec, n_rows=n_preview)
-                except Exception as e:
-                    raise click.ClickException(f"Could not fetch preview: {e}")
-
-                table = RichTable(title=f"Loci preview: {loci_path.name}", show_header=False)
-                table.add_column("Row", style="dim", width=4)
-                for col_idx in range(min(len(preview.columns), 6)):
-                    table.add_column(f"Col {col_idx}", overflow="ellipsis", max_width=30)
-                for i, row in preview.iterrows():
-                    vals = [str(v) if pd.notna(v) else "" for v in row.values[:6]]
-                    style = "bold green" if loci_skip is not None and i == loci_skip else None
-                    table.add_row(str(i), *vals, style=style)
-                console.print(table)
-                if len(preview.columns) > 6:
-                    click.echo(f"  ... and {len(preview.columns) - 6} more columns")
-
-                if loci_skip is None:
-                    loci_skip = click.prompt(
-                        "\nWhich row is the header? (rows above it will be skipped)",
-                        type=int, default=0,
-                    )
-                else:
-                    click.echo(f"\nHeader row: {loci_skip}")
-                    if not click.confirm("Proceed?", default=True):
-                        raise SystemExit(0)
-
-                kwargs = {"engine": "calamine"}
-                if loci_sheet:
-                    kwargs["sheet_name"] = loci_sheet
-                if loci_skip:
-                    kwargs["skiprows"] = loci_skip
-                loci_df = pd.read_excel(loci_path, **kwargs)
-                loci_path = None  # use loci_df instead
-
-    # --- Transforms: non-interactive (--transform-json) or interactive ---
-    accepted_transforms = None
-    if transform_json:
-        import json as _json
-        try:
-            accepted_transforms = _json.loads(transform_json)
-        except _json.JSONDecodeError as e:
-            raise click.ClickException(f"Invalid --transform-json: {e}")
-        if not isinstance(accepted_transforms, list):
-            raise click.ClickException("--transform-json must be a JSON list")
-
-    # --- Inspection + column mapping (before remaining prompts) ---
-    # Skip interactive inspection when transforms are explicitly provided
-    if loci_file and not transform_json:
-        inspect_df = loci_df
-        if inspect_df is None and loci_path is not None:
-            try:
-                inspect_df = pd.read_csv(
-                    loci_path,
-                    sep="\t" if str(loci_path).endswith((".tsv", ".gz")) else ",",
-                )
-            except Exception:
-                inspect_df = None
-
-        if inspect_df is not None:
-            try:
-                from pegasus_v2f.study_inspect import inspect_sentinels, render_study_inspection
-
-                label = loci_sheet or (loci_file.rstrip("/").split("/")[-1] if "/" in loci_file else loci_file)
-                inspection = inspect_sentinels(
-                    inspect_df,
-                    source_label=label,
-                    window_kb=window_kb,
-                    merge_distance_kb=merge_kb,
-                    cache_dir=root / ".v2f",
-                    gene_col=gene_column,
-                    pvalue_col=pvalue_column,
-                    rsid_col=rsid_column,
-                    sentinel_col=sentinel_column,
-                )
-                render_study_inspection(inspection)
-
-                # Build column proposals from heuristic or AI
-                col_proposals = {}
-                available_cols = inspect_df.columns.tolist()
-
-                ai_suggestion = None
-                if use_ai:
-                    ai_suggestion = _show_ai_suggestion(
-                        inspection, heuristic_fixes=inspection.suggested_fixes,
-                    )
-                    if ai_suggestion and ai_suggestion.column_mappings:
-                        m = ai_suggestion.column_mappings
-                        for role in ("gene", "sentinel_id", "pvalue", "rsid"):
-                            if m.get(role):
-                                col_proposals[role] = m[role]
-                else:
-                    # Heuristic detection
-                    det = inspection.column_detection
-                    if det.gene:
-                        col_proposals["gene"] = det.gene
-                    if det.sentinel_id:
-                        col_proposals["sentinel_id"] = det.sentinel_id
-                    if det.pvalue:
-                        col_proposals["pvalue"] = det.pvalue
-                    if det.rsid:
-                        col_proposals["rsid"] = det.rsid
-
-                # 1. Column mappings first
-                unset_proposals = {}
-                if not gene_column and col_proposals.get("gene"):
-                    unset_proposals["gene"] = col_proposals["gene"]
-                if not sentinel_column and col_proposals.get("sentinel_id"):
-                    unset_proposals["sentinel_id"] = col_proposals["sentinel_id"]
-                if not pvalue_column and col_proposals.get("pvalue"):
-                    unset_proposals["pvalue"] = col_proposals["pvalue"]
-                if not rsid_column and col_proposals.get("rsid"):
-                    unset_proposals["rsid"] = col_proposals["rsid"]
-
-                if unset_proposals:
-                    source_label = "AI" if use_ai else "Detected"
-                    accepted_cols = _confirm_column_mappings(
-                        unset_proposals, available_cols, label=source_label,
-                    )
-                    gene_column = accepted_cols.get("gene", gene_column)
-                    sentinel_column = accepted_cols.get("sentinel_id", sentinel_column)
-                    pvalue_column = accepted_cols.get("pvalue", pvalue_column)
-                    rsid_column = accepted_cols.get("rsid", rsid_column)
-
-                # 2. Transforms second
-                if use_ai and ai_suggestion and ai_suggestion.transformations:
-                    ai_fixes = _ai_transforms_to_fixes(ai_suggestion.transformations)
-                    accepted_transforms = _apply_suggested_fixes(ai_fixes)
-                elif inspection.suggested_fixes:
-                    accepted_transforms = _apply_suggested_fixes(inspection.suggested_fixes)
-
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except Exception as e:
-                click.echo(f"  Inspection skipped: {e}", err=True)
-
-    # --- Remaining interactive prompts (after inspection) ---
-    if interactive:
-        if not traits_str:
-            traits_str = questionary.text("Traits (comma-separated, e.g. FEV1,FVC):").ask()
-            if traits_str is None:
-                raise SystemExit(0)
-        if not gwas_source:
-            gwas_source = questionary.text("GWAS source (PMID or GCST, optional):").ask() or None
-        if not ancestry:
-            ancestry = questionary.text("Ancestry (optional):").ask() or None
-        if not sample_size:
-            size_str = questionary.text("Sample size (optional):").ask()
-            if size_str:
-                sample_size = int(size_str)
-        if not doi:
-            doi = questionary.text("DOI (optional):").ask() or None
-        if not year:
-            year_str = questionary.text("Year (optional):").ask()
-            if year_str:
-                year = int(year_str)
-        if window_kb == 500:
-            wk_str = questionary.text("Locus window half-size in kb:", default="500").ask()
-            if wk_str:
-                window_kb = int(wk_str)
-        if merge_kb == 250:
-            mk_str = questionary.text("Merge distance in kb:", default="250").ask()
-            if mk_str:
-                merge_kb = int(mk_str)
+            name = Path(loci_file).stem.replace(" ", "_").lower()
 
     traits = [t.strip() for t in traits_str.split(",") if t.strip()]
     if not traits:
         raise click.ClickException("At least one trait is required")
 
-    genome_build = config.get("database", {}).get("genome_build", "hg38")
+    # Load sentinel data
+    loci_df = _load_loci_file(loci_file, loci_sheet, loci_skip)
 
-    if interactive:
-        build_answer = questionary.text("Genome build:", default=genome_build).ask()
-        if build_answer is None:
-            raise SystemExit(0)
-        genome_build = build_answer.strip() or genome_build
+    # AI suggestion
+    ai_suggestion = None
+    if use_ai:
+        from pegasus_v2f.ai_assist import get_provider
+        from pegasus_v2f.study_inspect import inspect_sentinels
+        provider = get_provider("auto")
+        if provider:
+            inspection_for_ai = inspect_sentinels(loci_df, source_label=name, cache_dir=cache_dir)
+            ai_suggestion = provider.suggest(inspection_for_ai, heuristic_fixes=inspection_for_ai.suggested_fixes)
 
-    # If loci provided, create studies and loci in DB
-    if loci_file:
-        from pegasus_v2f.study_management import add_study as _add_study
-        from pegasus_v2f.report import Report, render_report
+    # Propose config
+    proposed, inspection = propose_study_config(
+        loci_df, name, traits, loci_source=loci_file,
+        loci_sheet=loci_sheet, loci_skip=loci_skip,
+        window_kb=window_kb, merge_distance_kb=merge_kb,
+        ai_suggestion=ai_suggestion, cache_dir=cache_dir,
+        gene_column=gene_column, sentinel_column=sentinel_column,
+        pvalue_column=pvalue_column, rsid_column=rsid_column,
+        gwas_source=gwas_source, ancestry=ancestry, sex=sex,
+        sample_size=sample_size, doi=doi, year=year,
+    )
 
-        report = Report(operation="study_add")
-
-        conn = get_connection(db=db_arg, config=config, project_root=root)
+    # Apply transform-json override
+    if transform_json:
+        import json as _json
         try:
-            create_pegasus_schema(conn)
-            result = _add_study(
-                conn,
-                study_name=study_name,
-                traits=traits,
-                loci_file=loci_path,
-                loci_df=loci_df,
-                gwas_source=gwas_source,
-                ancestry=ancestry,
-                sex=sex,
-                sample_size=sample_size,
-                doi=doi,
-                year=year,
-                genome_build=genome_build,
-                gene_column=gene_column,
-                sentinel_column=sentinel_column,
-                pvalue_column=pvalue_column,
-                rsid_column=rsid_column,
-                loci_source=loci_file,
-                loci_sheet=loci_sheet,
-                loci_skip=loci_skip,
-                window_kb=window_kb,
-                merge_distance_kb=merge_kb,
-                transformations=accepted_transforms or None,
-                cache_dir=root / ".v2f",
-                config_path=config_path,
-                report=report,
-            )
+            transforms = _json.loads(transform_json)
+        except _json.JSONDecodeError as e:
+            raise click.ClickException(f"Invalid --transform-json: {e}")
+        proposed["transformations"] = transforms
+
+    # Validate
+    config = read_config(root)
+    locus_def = config.get("pegasus", {}).get("locus_definition", {})
+    validation = validate_study(proposed, locus_def=locus_def, df=loci_df)
+
+    is_json = json_output or ctx.obj.get("json_output")
+
+    if not is_json:
+        # Render results
+        render_study_inspection(inspection)
+        _render_proposed_config(proposed, "study")
+        render_validation(validation)
+
+    if not validation.is_valid:
+        if is_json:
+            import json as _json
+            print(_json.dumps({
+                "error": "validation_failed",
+                "proposed_config": proposed,
+                "validation": validation.to_dict(),
+            }, indent=2))
+        raise click.ClickException("Config not written. Fix errors and re-run.")
+
+    # Check for existing entry
+    existing = [s for s in get_study_list(config) if s.get("id_prefix") == name]
+    if existing and not force:
+        raise click.ClickException(f"Study '{name}' already in v2f.yaml. Use --force to replace.")
+
+    # Write to v2f.yaml
+    if existing and force:
+        remove_study_from_yaml(config_path, name)
+
+    locus_config = None
+    if not config.get("pegasus", {}).get("locus_definition"):
+        locus_config = {"window_kb": window_kb, "merge_distance_kb": merge_kb}
+
+    try:
+        add_study_to_yaml(config_path, proposed, locus_config)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+
+    if is_json:
+        import json as _json
+        output = {
+            "proposed_config": proposed,
+            "validation": validation.to_dict(),
+            "inspection": inspection.to_dict(),
+            "written": True,
+        }
+        print(_json.dumps(output, indent=2))
+    else:
+        click.echo(f"Wrote config for study '{name}' to v2f.yaml")
+
+
+@study.command("load")
+@handle_errors
+@click.argument("name")
+@click.option("--force", is_flag=True, help="Replace existing DB entry.")
+@click.option("-y", "--yes", is_flag=True, help="Skip confirmation.")
+@click.option("--json", "json_output", is_flag=True, help="Output structured JSON.")
+@click.pass_context
+def study_load(ctx, name, force, yes, json_output):
+    """Load a configured study from v2f.yaml into the database.
+
+    Reads the study config by NAME, validates against data, then loads.
+    """
+    from pegasus_v2f.project import find_project_root
+    from pegasus_v2f.config import read_config, get_study_by_id, remove_study_from_yaml
+    from pegasus_v2f.db import get_connection
+    from pegasus_v2f.validate import validate_study, render_validation
+
+    root = find_project_root(ctx.obj.get("project"))
+    if not root:
+        raise click.ClickException("Not in a v2f project (no v2f.yaml found)")
+
+    config = read_config(root)
+    study_config = get_study_by_id(config, name)
+    if not study_config:
+        raise click.ClickException(f"Study '{name}' not found in v2f.yaml")
+
+    locus_def = config.get("pegasus", {}).get("locus_definition", {})
+
+    # Validate before loading
+    validation = validate_study(study_config, locus_def=locus_def)
+
+    if json_output or ctx.obj.get("json_output"):
+        import json as _json
+        if not validation.is_valid:
+            print(_json.dumps({"error": "validation_failed", "validation": validation.to_dict()}, indent=2))
+            raise click.ClickException("Validation failed. Fix errors and re-run.")
+    else:
+        render_validation(validation)
+
+    if not validation.is_valid:
+        raise click.ClickException("Config not loaded. Fix errors and re-run.")
+
+    if not yes and not json_output:
+        if not click.confirm(f"Load study '{name}' into database?", default=True):
+            raise SystemExit(0)
+
+    # Load into DB
+    db_arg = ctx.obj.get("db")
+    config_path = root / "v2f.yaml"
+
+    from pegasus_v2f.pegasus_schema import create_pegasus_schema
+    from pegasus_v2f.study_management import add_study as _add_study, remove_study as _remove_study
+    from pegasus_v2f.report import Report, render_report
+
+    report = Report(operation="study_load")
+    conn = get_connection(db=db_arg, config=config, project_root=root)
+
+    try:
+        create_pegasus_schema(conn)
+
+        if force:
+            try:
+                _remove_study(conn, name)
+            except ValueError:
+                pass
+
+        result = _add_study(
+            conn,
+            study_name=name,
+            traits=study_config.get("traits", []),
+            loci_source=study_config.get("loci_source"),
+            loci_sheet=study_config.get("loci_sheet"),
+            loci_skip=study_config.get("loci_skip"),
+            gwas_source=study_config.get("gwas_source"),
+            ancestry=study_config.get("ancestry"),
+            sex=study_config.get("sex"),
+            sample_size=study_config.get("sample_size"),
+            doi=study_config.get("doi"),
+            year=study_config.get("year"),
+            genome_build=study_config.get("genome_build", config.get("database", {}).get("genome_build", "hg38")),
+            gene_column=study_config.get("gene_column"),
+            sentinel_column=study_config.get("sentinel_column"),
+            pvalue_column=study_config.get("pvalue_column"),
+            rsid_column=study_config.get("rsid_column"),
+            window_kb=locus_def.get("window_kb", 500),
+            merge_distance_kb=locus_def.get("merge_distance_kb", 250),
+            transformations=study_config.get("transformations"),
+            cache_dir=root / ".v2f",
+            config_path=None,  # Don't re-write yaml (already configured)
+            report=report,
+        )
+
+        if json_output or ctx.obj.get("json_output"):
+            import json as _json
+            print(_json.dumps({
+                "name": name,
+                "n_loci": result["n_loci"],
+                "n_sentinels": result["n_sentinels"],
+                "validation": validation.to_dict(),
+            }, indent=2))
+        else:
             click.echo(
-                f"Added study '{study_name}' with {len(traits)} trait(s): "
+                f"Loaded study '{name}': "
                 f"{result['n_loci']} loci from {result['n_sentinels']} sentinels"
             )
-            if ctx.obj.get("json_output"):
-                render_report(report, json_mode=True)
-            elif report.has_warnings:
+            if report.has_warnings:
                 render_report(report)
-        finally:
-            conn.close()
+    finally:
+        conn.close()
+
+
+def _load_loci_file(loci_file, loci_sheet=None, loci_skip=None):
+    """Load sentinel data from a file path or URL. Shared by study commands."""
+    from pathlib import Path
+    import pandas as pd
+
+    if loci_file.startswith("http"):
+        from pegasus_v2f.loaders import load_googlesheets
+        source_spec = {"url": loci_file, "source_type": "googlesheets"}
+        if loci_sheet:
+            source_spec["sheet"] = loci_sheet
+        if loci_skip:
+            source_spec["skip_rows"] = loci_skip
+        return load_googlesheets(source_spec)
+
+    loci_path = Path(loci_file)
+    if not loci_path.exists():
+        raise click.ClickException(f"File not found: {loci_path}")
+
+    if loci_path.suffix.lower() in (".xlsx", ".xls"):
+        kwargs = {"engine": "calamine"}
+        if loci_sheet:
+            kwargs["sheet_name"] = loci_sheet
+        if loci_skip:
+            kwargs["skiprows"] = loci_skip
+        return pd.read_excel(loci_path, **kwargs)
+    elif loci_path.suffix.lower() in (".tsv", ".gz"):
+        return pd.read_csv(loci_path, sep="\t")
     else:
-        # No loci file — just write config (study_management won't be called)
-        study_config = {"id_prefix": study_name, "traits": traits}
-        if gwas_source:
-            study_config["gwas_source"] = gwas_source
-        if ancestry:
-            study_config["ancestry"] = ancestry
-        if doi:
-            study_config["doi"] = doi
-        if year:
-            study_config["year"] = year
-
-        locus_config = None
-        if not config.get("pegasus", {}).get("locus_definition"):
-            locus_config = {"window_kb": window_kb, "merge_distance_kb": merge_kb}
-
-        try:
-            add_study_to_yaml(config_path, study_config, locus_config)
-        except ValueError as e:
-            raise click.ClickException(str(e))
-
-        click.echo(f"Added study '{study_name}' with traits: {', '.join(traits)} (no loci file — use --loci to create loci)")
+        return pd.read_csv(loci_path)
 
 
 @study.command("show")
@@ -2389,7 +1944,7 @@ def table_list(ctx):
         tbl_list = _list_tables(conn)
 
     if not tbl_list:
-        click.echo("No tables found. Use 'v2f source add' first.")
+        click.echo("No tables found. Use 'v2f source configure' + 'v2f source load' first.")
         return
 
     console = Console()
@@ -2616,5 +2171,5 @@ def export_pegasus(ctx, study_name, output):
 
     # NOTE: _pick_column, _integrate_locus_source, _integrate_evidence_source,
     # and _integrate_multi_evidence helpers were removed along with the
-    # `source integrate` command. Evidence mapping now happens via `source add`
+    # `source integrate` command. Evidence mapping now happens via `source configure`
     # with evidence: blocks in v2f.yaml config.

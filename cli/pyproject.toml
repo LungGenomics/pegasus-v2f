@@ -13,7 +13,6 @@ dependencies = [
     "rich>=13.0",
     "psycopg2-binary>=2.9",
     "python-calamine>=0.2",
-    "questionary>=2.0",
 ]
 
 [project.optional-dependencies]

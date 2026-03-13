@@ -219,7 +219,7 @@ EVIDENCE_CATEGORIES: dict[str, str] = {
 GENES_DDL = """
 CREATE TABLE IF NOT EXISTS genes (
     gene_symbol VARCHAR PRIMARY KEY,
-    ensembl_gene_id VARCHAR UNIQUE,
+    ensembl_gene_id VARCHAR,
     gene_name VARCHAR,
     chromosome VARCHAR,
     start_position BIGINT,
