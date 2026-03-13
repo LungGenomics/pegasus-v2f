@@ -200,6 +200,8 @@ You may suggest data transformations from this list. Each is a JSON dict with "t
 - filter_values: {{"type": "filter_values", "column": "<col>", "pattern": "<regex>"}} — Keep rows matching regex.
 - deduplicate: {{"type": "deduplicate", "column": "<col>"}} — Remove duplicate rows (keeps first).
 - select: {{"type": "select", "columns": ["col1", "col2"]}} — Select specific columns (drop others).
+- parse_variant_id: {{"type": "parse_variant_id", "column": "<col>"}} — Parse a variant ID column (e.g. "chr1:16979534C:A", "10:103897116:G:A") into separate "chr" and "pos" columns. Use when data has a combined variant identifier but no separate chromosome/position columns.
+- split_column: {{"type": "split_column", "column": "<col>", "delimiter": "<delim>", "index": N, "output": "<out_col>"}} — Split a column by delimiter and keep the Nth part (0-based). If "output" is omitted, overwrites the source column. Use when a value like "GENE_rsid_alleles" needs to be split to extract one component.
 
 Only suggest transformations that are clearly needed based on the data. Do not suggest transformations speculatively.
 

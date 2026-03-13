@@ -82,6 +82,83 @@ class TestApplyTransformations:
         assert len(result) == 2
         assert result.iloc[0]["val"] == 1  # keeps first
 
+    def test_parse_variant_id_chr_prefix(self):
+        df = pd.DataFrame({
+            "PrimaryVariantId": [
+                "chr1:16979534C:A",
+                "chr4:15579131T:G",
+                "chr10:103897116G:A",
+            ],
+            "pvalue": [1e-10, 1e-8, 1e-12],
+        })
+        result = apply_transformations(df, [
+            {"type": "parse_variant_id", "column": "PrimaryVariantId"}
+        ])
+        assert "chr" in result.columns
+        assert "pos" in result.columns
+        assert list(result["chr"]) == ["1", "4", "10"]
+        assert list(result["pos"]) == [16979534, 15579131, 103897116]
+
+    def test_parse_variant_id_no_prefix(self):
+        df = pd.DataFrame({
+            "variant": ["1:16979534:C:A", "10:103897116:G:A"],
+        })
+        result = apply_transformations(df, [
+            {"type": "parse_variant_id", "column": "variant"}
+        ])
+        assert list(result["chr"]) == ["1", "10"]
+        assert list(result["pos"]) == [16979534, 103897116]
+
+    def test_parse_variant_id_pos_only(self):
+        df = pd.DataFrame({
+            "vid": ["chr3:44861942", "chr6:7562999"],
+        })
+        result = apply_transformations(df, [
+            {"type": "parse_variant_id", "column": "vid"}
+        ])
+        assert list(result["chr"]) == ["3", "6"]
+        assert list(result["pos"]) == [44861942, 7562999]
+
+    def test_parse_variant_id_case_insensitive(self):
+        """Column names may be lowercased before transforms run."""
+        df = pd.DataFrame({
+            "primaryvariantid": ["chr1:16979534C:A", "chr10:103897116G:A"],
+        })
+        result = apply_transformations(df, [
+            {"type": "parse_variant_id", "column": "PrimaryVariantId"}
+        ])
+        assert list(result["chr"]) == ["1", "10"]
+        assert list(result["pos"]) == [16979534, 103897116]
+
+    def test_parse_variant_id_missing_column(self):
+        df = pd.DataFrame({"a": [1]})
+        result = apply_transformations(df, [
+            {"type": "parse_variant_id", "column": "nonexistent"}
+        ])
+        assert "chr" not in result.columns
+
+    def test_split_column_default(self):
+        df = pd.DataFrame({"name": ["GATA5_rs200383755_C_G", "TP53_rs123_A_T"]})
+        result = apply_transformations(df, [
+            {"type": "split_column", "column": "name", "delimiter": "_", "index": 0}
+        ])
+        assert list(result["name"]) == ["GATA5", "TP53"]
+
+    def test_split_column_output(self):
+        df = pd.DataFrame({"combo": ["chr1:12345", "chr2:67890"]})
+        result = apply_transformations(df, [
+            {"type": "split_column", "column": "combo", "delimiter": ":", "index": 1, "output": "pos"}
+        ])
+        assert list(result["pos"]) == ["12345", "67890"]
+        assert list(result["combo"]) == ["chr1:12345", "chr2:67890"]  # original preserved
+
+    def test_split_column_missing(self):
+        df = pd.DataFrame({"a": [1]})
+        result = apply_transformations(df, [
+            {"type": "split_column", "column": "nonexistent"}
+        ])
+        assert list(result.columns) == ["a"]
+
     def test_unknown_type_warns(self):
         df = pd.DataFrame({"a": [1]})
         result = apply_transformations(df, [{"type": "bogus"}])

@@ -903,10 +903,11 @@ def _build_evidence_blocks_interactive(source_name, preview_df, gene_column,
 @click.option("--evidence-json", default=None,
     help="JSON list of evidence blocks (for multi-category non-interactive use).")
 @click.option("--ai", "use_ai", is_flag=True, help="Enable AI-assisted category suggestion.")
+@click.option("--transform-json", default=None, help="JSON list of transformations to apply (non-interactive).")
 @click.pass_context
 def source_add(ctx, name, source_type, url, file_path, sheet, skip_rows, gene_column,
                display_name, category, traits, source_tag, centric, no_score, force,
-               evidence_json, use_ai):
+               evidence_json, use_ai, transform_json):
     """Add a data source with evidence configuration.
 
     Shows a preview of the first rows so you can confirm which row is the
@@ -1004,9 +1005,20 @@ def source_add(ctx, name, source_type, url, file_path, sheet, skip_rows, gene_co
     if skip_rows:
         source_def["skip_rows"] = skip_rows
 
+    # --- Transforms: non-interactive (--transform-json) ---
+    if transform_json:
+        import json as _json
+        try:
+            transforms = _json.loads(transform_json)
+        except _json.JSONDecodeError as e:
+            raise click.ClickException(f"Invalid --transform-json: {e}")
+        if not isinstance(transforms, list):
+            raise click.ClickException("--transform-json must be a JSON list")
+        source_def.setdefault("transformations", []).extend(transforms)
+
     # --- Pre-wizard inspection + AI + fix suggestions ---
     ai_suggestion = None
-    if category is None and evidence_json is None:
+    if category is None and evidence_json is None and not transform_json:
         # Interactive mode — run inspection before wizard
         from pegasus_v2f.loaders import load_source
         from pegasus_v2f.inspect import inspect_dataframe, render_inspection
@@ -1063,11 +1075,12 @@ def source_add(ctx, name, source_type, url, file_path, sheet, skip_rows, gene_co
         trait_list = None
         if traits:
             trait_list = [t.strip() for t in traits.split(",") if t.strip()]
+        # load_source renames gene_column -> "gene", so fields always reference "gene"
         ev_block = {
             "source_tag": source_tag or name,
             "category": category,
             "centric": centric or "gene",
-            "fields": {"gene": gene_column},
+            "fields": {"gene": "gene"},
         }
         if trait_list:
             ev_block["traits"] = trait_list
@@ -1785,11 +1798,13 @@ def study_inspect(ctx, loci_file, sheet, skip_rows, window_kb, merge_kb,
 @click.option("--merge-kb", type=int, default=250, help="Merge distance in kb (default: 250)")
 @click.option("--force", is_flag=True, help="Replace study if it already exists.")
 @click.option("--ai", "use_ai", is_flag=True, help="AI-assisted inspection and transformations before adding.")
+@click.option("--transform-json", help="JSON list of transformations to apply (non-interactive).")
 @click.pass_context
 def study_add(ctx, study_name, loci_file, loci_sheet, loci_skip, gene_column,
               sentinel_column, pvalue_column, rsid_column,
               traits_str, gwas_source, ancestry,
-              sex, sample_size, doi, year, window_kb, merge_kb, force, use_ai):
+              sex, sample_size, doi, year, window_kb, merge_kb, force, use_ai,
+              transform_json):
     """Add a new study with loci from a sentinel variant file.
 
     If STUDY_NAME, --loci, and --traits are provided, runs non-interactively.
@@ -1947,9 +1962,20 @@ def study_add(ctx, study_name, loci_file, loci_sheet, loci_skip, gene_column,
                 loci_df = pd.read_excel(loci_path, **kwargs)
                 loci_path = None  # use loci_df instead
 
-    # --- Inspection + column mapping (before remaining prompts) ---
+    # --- Transforms: non-interactive (--transform-json) or interactive ---
     accepted_transforms = None
-    if loci_file:
+    if transform_json:
+        import json as _json
+        try:
+            accepted_transforms = _json.loads(transform_json)
+        except _json.JSONDecodeError as e:
+            raise click.ClickException(f"Invalid --transform-json: {e}")
+        if not isinstance(accepted_transforms, list):
+            raise click.ClickException("--transform-json must be a JSON list")
+
+    # --- Inspection + column mapping (before remaining prompts) ---
+    # Skip interactive inspection when transforms are explicitly provided
+    if loci_file and not transform_json:
         inspect_df = loci_df
         if inspect_df is None and loci_path is not None:
             try:

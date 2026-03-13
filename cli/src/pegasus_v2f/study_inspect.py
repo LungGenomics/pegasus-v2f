@@ -39,7 +39,7 @@ _SENTINEL_COLUMN_HINTS: dict[str, list[str]] = {
     "gene": ["gene", "gene_symbol", "nearest_gene", "gene_name", "symbol"],
     "pvalue": ["pvalue", "p_value", "p.value", "pval", "p", "min_p"],
     "rsid": ["rsid", "rs_id", "snp", "rs", "dbsnp"],
-    "sentinel_id": ["variant_id", "sentinel", "variant", "lead_variant", "varid"],
+    "sentinel_id": ["variant_id", "sentinel", "variant", "lead_variant", "varid", "primaryvariantid"],
 }
 
 
@@ -499,6 +499,16 @@ def _generate_fixes(
             "null_genes",
             f"{gene_analysis.null_count} rows have empty gene column.",
             None,
+        ))
+
+    # If no chr/pos columns but a sentinel_id column exists with variant ID
+    # patterns (e.g. chr1:16979534C:A), suggest parsing it into chr + pos.
+    if not detection.chromosome and not detection.position and detection.sentinel_id:
+        fixes.insert(0, SuggestedFix(
+            "parse_variant_id",
+            f"No chromosome/position columns found, but '{detection.sentinel_id}' "
+            f"looks like a variant ID column. Parse it into separate chr and pos columns.",
+            {"type": "parse_variant_id", "column": detection.sentinel_id},
         ))
 
     return fixes

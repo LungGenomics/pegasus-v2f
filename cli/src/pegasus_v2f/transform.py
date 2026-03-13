@@ -30,6 +30,7 @@ def clean_for_db(df: pd.DataFrame) -> pd.DataFrame:
 
     # Clean column names
     new_cols = {}
+    seen = {}
     for col in df.columns:
         cleaned = str(col)
         cleaned = cleaned.replace(".", "_")
@@ -37,6 +38,14 @@ def clean_for_db(df: pd.DataFrame) -> pd.DataFrame:
         cleaned = re.sub(r"[^A-Za-z0-9_]", "_", cleaned)
         cleaned = re.sub(r"_{2,}", "_", cleaned)
         cleaned = cleaned.strip("_")
+        if not cleaned:
+            cleaned = "unnamed"
+        # Deduplicate column names
+        if cleaned in seen:
+            seen[cleaned] += 1
+            cleaned = f"{cleaned}_{seen[cleaned]}"
+        else:
+            seen[cleaned] = 0
         new_cols[col] = cleaned
 
     df = df.rename(columns=new_cols)
@@ -81,6 +90,10 @@ def apply_transformations(
                 df = _transform_coerce_numeric(df, t)
             elif t_type == "filter_values":
                 df = _transform_filter_values(df, t)
+            elif t_type == "parse_variant_id":
+                df = _transform_parse_variant_id(df, t)
+            elif t_type == "split_column":
+                df = _transform_split_column(df, t)
             elif t_type == "custom":
                 df = _transform_custom(df, t)
             else:
@@ -181,6 +194,65 @@ def _transform_filter_values(df: pd.DataFrame, t: dict) -> pd.DataFrame:
     pattern = t.get("pattern")
     if col and col in df.columns and pattern:
         df = df[df[col].astype(str).str.match(pattern, na=False)]
+    return df
+
+
+def _transform_parse_variant_id(df: pd.DataFrame, t: dict) -> pd.DataFrame:
+    """Parse a variant ID column into separate chr and pos columns.
+
+    Handles formats like:
+      chr1:16979534C:A  -> chr=1, pos=16979534
+      chr4:15579131T:G  -> chr=4, pos=15579131
+      chr3:44861942     -> chr=3, pos=44861942
+      1:16979534:C:A    -> chr=1, pos=16979534
+      10:103897116:G:A  -> chr=10, pos=103897116
+
+    The column is identified by the 'column' key in the transform dict.
+    """
+    col = t.get("column")
+    if not col:
+        logger.warning("parse_variant_id: no 'column' specified")
+        return df
+
+    # Case-insensitive column lookup (columns may have been lowercased)
+    col_lower = {c.lower(): c for c in df.columns}
+    actual_col = col_lower.get(col.lower()) if col not in df.columns else col
+    if not actual_col or actual_col not in df.columns:
+        logger.warning(f"parse_variant_id: column '{col}' not found")
+        return df
+
+    parsed = df[actual_col].astype(str).str.extract(
+        r"^(?:chr)?(\w+)[:\-_](\d+)", expand=True
+    )
+    parsed.columns = ["chr", "pos"]
+    parsed["pos"] = pd.to_numeric(parsed["pos"], errors="coerce")
+
+    df = df.copy()
+    df["chr"] = parsed["chr"]
+    df["pos"] = parsed["pos"]
+    return df
+
+
+def _transform_split_column(df: pd.DataFrame, t: dict) -> pd.DataFrame:
+    """Split a column by delimiter and keep the Nth part.
+
+    Config keys:
+        column: source column name
+        delimiter: string to split on (default "_")
+        index: which part to keep, 0-based (default 0 = first)
+        output: output column name (default: overwrites source column)
+    """
+    col = t.get("column")
+    if not col or col not in df.columns:
+        logger.warning(f"split_column: column '{col}' not found")
+        return df
+
+    delimiter = t.get("delimiter", "_")
+    index = t.get("index", 0)
+    output = t.get("output", col)
+
+    df = df.copy()
+    df[output] = df[col].astype(str).str.split(delimiter).str[index]
     return df
 
 
